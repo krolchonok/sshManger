@@ -6,6 +6,8 @@ const { spawn } = require('child_process');
 const { ASKPASS_DIR, LOG_DIR, ensureDirs } = require('./paths');
 const { nowIso } = require('./state');
 
+const DEFAULT_COMMAND_OUTPUT_LIMIT_BYTES = 200 * 1024;
+
 function isProcessAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) {
     return false;
@@ -20,6 +22,306 @@ function isProcessAlive(pid) {
     }
     return false;
   }
+}
+
+function appendLimitedChunk(chunks, totalSize, chunk, freeBytes) {
+  const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk || ''), 'utf8');
+  if (buffer.length === 0) {
+    return { totalSize, addedBytes: 0, truncated: false };
+  }
+  if (freeBytes <= 0) {
+    return { totalSize, addedBytes: 0, truncated: true };
+  }
+
+  if (buffer.length <= freeBytes) {
+    chunks.push(buffer);
+    return { totalSize: totalSize + buffer.length, addedBytes: buffer.length, truncated: false };
+  }
+
+  chunks.push(buffer.subarray(0, freeBytes));
+  return { totalSize: totalSize + freeBytes, addedBytes: freeBytes, truncated: true };
+}
+
+function runSshCommand(host, command, options = {}) {
+  return new Promise((resolve) => {
+    const targetHost = String(host || '').trim();
+    const remoteCommand = String(command || '').trim();
+    let outputLimitBytes = DEFAULT_COMMAND_OUTPUT_LIMIT_BYTES;
+    let password = '';
+
+    if (typeof options === 'number' && Number.isFinite(options) && options > 0) {
+      outputLimitBytes = Math.floor(options);
+    } else if (options && typeof options === 'object') {
+      if (Number.isFinite(options.outputLimitBytes) && options.outputLimitBytes > 0) {
+        outputLimitBytes = Math.floor(options.outputLimitBytes);
+      }
+      if (typeof options.password === 'string' && options.password.length > 0) {
+        password = options.password;
+      }
+    }
+
+    if (!targetHost) {
+      resolve({
+        code: null,
+        signal: null,
+        error: 'Host is required',
+        truncated: false,
+        stdout: '',
+        stderr: ''
+      });
+      return;
+    }
+
+    if (!remoteCommand) {
+      resolve({
+        code: null,
+        signal: null,
+        error: 'Command is required',
+        truncated: false,
+        stdout: '',
+        stderr: ''
+      });
+      return;
+    }
+
+    const stdoutChunks = [];
+    const stderrChunks = [];
+    let stdoutSize = 0;
+    let stderrSize = 0;
+    let totalCaptured = 0;
+    let truncated = false;
+    let done = false;
+
+    const finish = (result) => {
+      if (done) {
+        return;
+      }
+      done = true;
+      resolve({
+        code: result.code,
+        signal: result.signal,
+        error: result.error,
+        truncated,
+        stdout: Buffer.concat(stdoutChunks, stdoutSize).toString('utf8'),
+        stderr: Buffer.concat(stderrChunks, stderrSize).toString('utf8')
+      });
+    };
+
+    let child = null;
+    let askpassPath = '';
+    try {
+      const env = { ...process.env };
+      const args = [];
+      if (password) {
+        const askpass = createAskpassScript(password);
+        askpassPath = askpass.filePath;
+        Object.assign(env, askpass.env);
+        args.push(
+          '-o',
+          'BatchMode=no',
+          '-o',
+          'PreferredAuthentications=password,keyboard-interactive',
+          '-o',
+          'PubkeyAuthentication=no'
+        );
+      } else {
+        args.push('-o', 'BatchMode=yes');
+      }
+      args.push(targetHost, remoteCommand);
+
+      child = spawn('ssh', args, {
+        cwd: process.cwd(),
+        env
+      });
+      if (askpassPath) {
+        cleanupAskpassLater(askpassPath);
+      }
+    } catch (error) {
+      if (askpassPath) {
+        cleanupAskpassLater(askpassPath);
+      }
+      finish({ code: null, signal: null, error: error.message });
+      return;
+    }
+
+    if (child.stdout) {
+      child.stdout.on('data', (chunk) => {
+        const appended = appendLimitedChunk(
+          stdoutChunks,
+          stdoutSize,
+          chunk,
+          outputLimitBytes - totalCaptured
+        );
+        stdoutSize = appended.totalSize;
+        totalCaptured += appended.addedBytes;
+        truncated = truncated || appended.truncated;
+      });
+    }
+
+    if (child.stderr) {
+      child.stderr.on('data', (chunk) => {
+        const appended = appendLimitedChunk(
+          stderrChunks,
+          stderrSize,
+          chunk,
+          outputLimitBytes - totalCaptured
+        );
+        stderrSize = appended.totalSize;
+        totalCaptured += appended.addedBytes;
+        truncated = truncated || appended.truncated;
+      });
+    }
+
+    child.on('error', (error) => {
+      finish({ code: null, signal: null, error: error.message });
+    });
+
+    child.on('close', (code, signal) => {
+      finish({
+        code: typeof code === 'number' ? code : null,
+        signal: signal || null,
+        error: null
+      });
+    });
+  });
+}
+
+function runSshCopyId(host, options = {}) {
+  return new Promise((resolve) => {
+    const targetHost = String(host || '').trim();
+    let outputLimitBytes = DEFAULT_COMMAND_OUTPUT_LIMIT_BYTES;
+    let password = '';
+    let publicKeyPath = '';
+
+    if (typeof options === 'number' && Number.isFinite(options) && options > 0) {
+      outputLimitBytes = Math.floor(options);
+    } else if (options && typeof options === 'object') {
+      if (Number.isFinite(options.outputLimitBytes) && options.outputLimitBytes > 0) {
+        outputLimitBytes = Math.floor(options.outputLimitBytes);
+      }
+      if (typeof options.password === 'string' && options.password.length > 0) {
+        password = options.password;
+      }
+      if (typeof options.publicKeyPath === 'string' && options.publicKeyPath.trim().length > 0) {
+        publicKeyPath = options.publicKeyPath.trim();
+      }
+    }
+
+    if (!targetHost) {
+      resolve({
+        code: null,
+        signal: null,
+        error: 'Host is required',
+        truncated: false,
+        stdout: '',
+        stderr: ''
+      });
+      return;
+    }
+
+    const stdoutChunks = [];
+    const stderrChunks = [];
+    let stdoutSize = 0;
+    let stderrSize = 0;
+    let totalCaptured = 0;
+    let truncated = false;
+    let done = false;
+
+    const finish = (result) => {
+      if (done) {
+        return;
+      }
+      done = true;
+      resolve({
+        code: result.code,
+        signal: result.signal,
+        error: result.error,
+        truncated,
+        stdout: Buffer.concat(stdoutChunks, stdoutSize).toString('utf8'),
+        stderr: Buffer.concat(stderrChunks, stderrSize).toString('utf8')
+      });
+    };
+
+    let child = null;
+    let askpassPath = '';
+    try {
+      const env = { ...process.env };
+      const args = [];
+      if (publicKeyPath) {
+        args.push('-i', publicKeyPath);
+      }
+      if (password) {
+        const askpass = createAskpassScript(password);
+        askpassPath = askpass.filePath;
+        Object.assign(env, askpass.env);
+        args.push(
+          '-o',
+          'BatchMode=no',
+          '-o',
+          'PreferredAuthentications=password,keyboard-interactive',
+          '-o',
+          'PubkeyAuthentication=no'
+        );
+      } else {
+        args.push('-o', 'BatchMode=yes');
+      }
+      args.push(targetHost);
+
+      child = spawn('ssh-copy-id', args, {
+        cwd: process.cwd(),
+        env
+      });
+      if (askpassPath) {
+        cleanupAskpassLater(askpassPath);
+      }
+    } catch (error) {
+      if (askpassPath) {
+        cleanupAskpassLater(askpassPath);
+      }
+      finish({ code: null, signal: null, error: error.message });
+      return;
+    }
+
+    if (child.stdout) {
+      child.stdout.on('data', (chunk) => {
+        const appended = appendLimitedChunk(
+          stdoutChunks,
+          stdoutSize,
+          chunk,
+          outputLimitBytes - totalCaptured
+        );
+        stdoutSize = appended.totalSize;
+        totalCaptured += appended.addedBytes;
+        truncated = truncated || appended.truncated;
+      });
+    }
+
+    if (child.stderr) {
+      child.stderr.on('data', (chunk) => {
+        const appended = appendLimitedChunk(
+          stderrChunks,
+          stderrSize,
+          chunk,
+          outputLimitBytes - totalCaptured
+        );
+        stderrSize = appended.totalSize;
+        totalCaptured += appended.addedBytes;
+        truncated = truncated || appended.truncated;
+      });
+    }
+
+    child.on('error', (error) => {
+      finish({ code: null, signal: null, error: error.message });
+    });
+
+    child.on('close', (code, signal) => {
+      finish({
+        code: typeof code === 'number' ? code : null,
+        signal: signal || null,
+        error: null
+      });
+    });
+  });
 }
 
 function runInteractiveSsh(host) {
@@ -216,6 +518,8 @@ function stopTunnel(pid) {
 
 module.exports = {
   runInteractiveSsh,
+  runSshCommand,
+  runSshCopyId,
   startTunnel,
   stopTunnel,
   isProcessAlive,

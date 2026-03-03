@@ -36,6 +36,10 @@ npm start
 - `s`: start selected tunnel
 - `x`: stop selected tunnel
 - `d` or `Delete`: delete selected tunnel record
+- `e`: run command on selected remote host (via SSH) and view its output
+- `i`: run `ssh-copy-id` for selected remote host
+- `o`: export SSHHelper config (tunnels + locale) to JSON file
+- `p`: import SSHHelper config from JSON file
 - `r`: reload hosts and tunnel statuses
 - `l`: switch UI language
 - `q` or `Ctrl+C`: quit

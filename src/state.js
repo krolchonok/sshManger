@@ -1,6 +1,7 @@
 'use strict';
 
 const fs = require('fs');
+const path = require('path');
 const { STATE_FILE, ensureDirs } = require('./paths');
 
 const DEFAULT_STATE = {
@@ -33,6 +34,27 @@ function normalizeTunnel(item) {
   };
 }
 
+function normalizeState(state) {
+  const source = state && typeof state === 'object' ? state : {};
+  return {
+    version: Number.isInteger(source.version) ? source.version : DEFAULT_STATE.version,
+    locale: typeof source.locale === 'string' ? source.locale : DEFAULT_STATE.locale,
+    tunnels: Array.isArray(source.tunnels) ? source.tunnels.map(normalizeTunnel).filter(Boolean) : []
+  };
+}
+
+function makePortableState(state) {
+  const normalized = normalizeState(state);
+  normalized.tunnels = normalized.tunnels.map((tunnel) => ({
+    ...tunnel,
+    pid: null,
+    logFile: '',
+    lastError: '',
+    updatedAt: nowIso()
+  }));
+  return normalized;
+}
+
 function loadState() {
   ensureDirs();
 
@@ -43,12 +65,7 @@ function loadState() {
   try {
     const raw = fs.readFileSync(STATE_FILE, 'utf8');
     const parsed = JSON.parse(raw);
-    const tunnels = Array.isArray(parsed.tunnels) ? parsed.tunnels.map(normalizeTunnel).filter(Boolean) : [];
-    return {
-      version: Number.isInteger(parsed.version) ? parsed.version : DEFAULT_STATE.version,
-      locale: typeof parsed.locale === 'string' ? parsed.locale : DEFAULT_STATE.locale,
-      tunnels
-    };
+    return normalizeState(parsed);
   } catch (error) {
     return { ...DEFAULT_STATE };
   }
@@ -56,17 +73,47 @@ function loadState() {
 
 function saveState(state) {
   ensureDirs();
-  const normalized = {
-    version: 1,
-    locale: typeof state.locale === 'string' ? state.locale : 'en',
-    tunnels: Array.isArray(state.tunnels) ? state.tunnels.map(normalizeTunnel).filter(Boolean) : []
-  };
+  const normalized = normalizeState(state);
+  normalized.version = 1;
   fs.writeFileSync(STATE_FILE, `${JSON.stringify(normalized, null, 2)}\n`, 'utf8');
+}
+
+function exportConfigToFile(state, filePath) {
+  const targetPath = String(filePath || '').trim();
+  if (!targetPath) {
+    throw new Error('File path is required');
+  }
+
+  const dirPath = path.dirname(targetPath);
+  if (dirPath) {
+    fs.mkdirSync(dirPath, { recursive: true });
+  }
+
+  const portableState = makePortableState(state);
+  fs.writeFileSync(targetPath, `${JSON.stringify(portableState, null, 2)}\n`, 'utf8');
+  return portableState;
+}
+
+function importConfigFromFile(filePath) {
+  const sourcePath = String(filePath || '').trim();
+  if (!sourcePath) {
+    throw new Error('File path is required');
+  }
+  if (!fs.existsSync(sourcePath)) {
+    throw new Error(`File not found: ${sourcePath}`);
+  }
+
+  const raw = fs.readFileSync(sourcePath, 'utf8');
+  const parsed = JSON.parse(raw);
+  return makePortableState(parsed);
 }
 
 module.exports = {
   loadState,
   saveState,
+  exportConfigToFile,
+  importConfigFromFile,
   normalizeTunnel,
+  normalizeState,
   nowIso
 };

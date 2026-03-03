@@ -1,19 +1,24 @@
 'use strict';
 
+const path = require('path');
 const blessed = require('blessed');
 const { createI18n, nextLocale } = require('./i18n');
-const { startTunnel, stopTunnel, isProcessAlive, buildTunnelSpec } = require('./ssh');
+const { startTunnel, stopTunnel, isProcessAlive, buildTunnelSpec, runSshCommand, runSshCopyId } = require('./ssh');
 const { loadHostsFromConfig, addHostToConfig, deleteHostFromConfig } = require('./sshConfig');
-const { nowIso } = require('./state');
+const { nowIso, exportConfigToFile, importConfigFromFile } = require('./state');
+const { HOME_DIR, STATE_DIR } = require('./paths');
 
+const PRIMARY_COLOR = 'green';
 const DIALOG_BG = 'black';
 const DIALOG_FG = 'white';
-const DIALOG_ACTIVE_FG = 'green';
+const DIALOG_ACTIVE_FG = PRIMARY_COLOR;
+const BUTTON_MIN_WIDTH = 12;
 const BUTTON_BG = 'white';
-const BUTTON_BG_ACTIVE = 'cyan';
+const BUTTON_BG_ACTIVE = PRIMARY_COLOR;
 const BUTTON_FG = 'black';
 const BUTTON_FG_ACTIVE = 'black';
 const DIALOG_BACK = '__dialog_back__';
+const COMMAND_OUTPUT_LIMIT_BYTES = 200 * 1024;
 
 function hideTerminalCursor(screen) {
   if (!screen || !screen.program) {
@@ -43,6 +48,25 @@ function generateId() {
   return `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
 }
 
+function resolveUserPath(inputPath) {
+  const rawPath = String(inputPath || '').trim();
+  if (!rawPath) {
+    return '';
+  }
+  if (rawPath === '~') {
+    return HOME_DIR;
+  }
+  if (rawPath.startsWith('~/')) {
+    return path.join(HOME_DIR, rawPath.slice(2));
+  }
+  return path.resolve(rawPath);
+}
+
+function defaultConfigExportPath() {
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  return path.join(STATE_DIR, `config-export-${stamp}.json`);
+}
+
 function isDialogBack(value) {
   return value === DIALOG_BACK;
 }
@@ -56,12 +80,146 @@ function styleDialogButton(button, isActive) {
   button.style.fg = isActive ? BUTTON_FG_ACTIVE : BUTTON_FG;
 }
 
+function getNodeWidth(screen, node, fallback) {
+  if (node && typeof node.width === 'number') {
+    return Math.max(1, Math.floor(node.width));
+  }
+
+  if (node && typeof node.width === 'string') {
+    const match = String(node.width).trim().match(/^(\d+(?:\.\d+)?)%$/);
+    if (match) {
+      const pct = Number(match[1]);
+      if (Number.isFinite(pct)) {
+        return Math.max(1, Math.floor((screen.width * pct) / 100));
+      }
+    }
+  }
+
+  if (node && node.lpos) {
+    return Math.max(1, node.lpos.xl - node.lpos.xi + 1);
+  }
+
+  return Math.max(1, fallback);
+}
+
+function getNodeHeight(screen, node, fallback) {
+  if (node && typeof node.height === 'number') {
+    return Math.max(1, Math.floor(node.height));
+  }
+
+  if (node && typeof node.height === 'string') {
+    const match = String(node.height).trim().match(/^(\d+(?:\.\d+)?)%$/);
+    if (match) {
+      const pct = Number(match[1]);
+      if (Number.isFinite(pct)) {
+        return Math.max(1, Math.floor((screen.height * pct) / 100));
+      }
+    }
+  }
+
+  if (node && node.lpos) {
+    return Math.max(1, node.lpos.yl - node.lpos.yi + 1);
+  }
+
+  return Math.max(1, fallback);
+}
+
+function layoutDialogButtons(screen, box, buttons, options = {}) {
+  const safeButtons = Array.isArray(buttons) ? buttons.filter(Boolean) : [];
+  if (!safeButtons.length) {
+    return;
+  }
+
+  const top = Number.isInteger(options.top) ? options.top : 7;
+  const left = Number.isInteger(options.left) ? options.left : 2;
+  const right = Number.isInteger(options.right) ? options.right : 2;
+  const gap = Number.isInteger(options.gap) ? options.gap : 1;
+  const boxWidth = getNodeWidth(screen, box, Math.floor(screen.width * 0.7));
+  const available = Math.max(1, boxWidth - left - right - 2);
+
+  const items = safeButtons.map((button) => {
+    const rawWidth = Number(button._baseDialogWidth || button.width);
+    const baseWidth = Number.isFinite(rawWidth) && rawWidth > 0
+      ? Math.floor(rawWidth)
+      : BUTTON_MIN_WIDTH;
+    return { button, baseWidth: Math.max(1, Math.min(baseWidth, available)) };
+  });
+
+  const rows = [{ items: [], used: 0 }];
+  for (const item of items) {
+    const row = rows[rows.length - 1];
+    const required = row.items.length > 0 ? gap + item.baseWidth : item.baseWidth;
+    if (row.items.length > 0 && row.used + required > available) {
+      rows.push({ items: [item], used: item.baseWidth });
+      continue;
+    }
+    row.items.push(item);
+    row.used += required;
+  }
+
+  rows.forEach((row, rowIndex) => {
+    const stretchRow = true;
+    let offset = left;
+
+    if (stretchRow) {
+      const totalGap = gap * Math.max(0, row.items.length - 1);
+      const totalBase = row.items.reduce((sum, entry) => sum + entry.baseWidth, 0);
+      const free = Math.max(0, available - totalGap - totalBase);
+      const addPerButton = Math.floor(free / row.items.length);
+      let remainder = free - addPerButton * row.items.length;
+
+      row.items.forEach(({ button, baseWidth }) => {
+        const width = Math.max(1, baseWidth + addPerButton + (remainder > 0 ? 1 : 0));
+        if (remainder > 0) {
+          remainder -= 1;
+        }
+        button.top = top + rowIndex;
+        button.left = offset;
+        button.width = width;
+        offset += width + gap;
+      });
+      return;
+    }
+
+    row.items.forEach(({ button, baseWidth }) => {
+      button.top = top + rowIndex;
+      button.left = offset;
+      button.width = baseWidth;
+      offset += baseWidth + gap;
+    });
+  });
+}
+
+function bindDialogButtonLayout(screen, box, buttons, options = {}) {
+  const applyLayout = () => layoutDialogButtons(screen, box, buttons, options);
+  const onResize = () => {
+    if (box.detached) {
+      return;
+    }
+    applyLayout();
+    screen.render();
+  };
+
+  screen.on('resize', onResize);
+  box.on('destroy', () => {
+    if (typeof screen.off === 'function') {
+      screen.off('resize', onResize);
+      return;
+    }
+    screen.removeListener('resize', onResize);
+  });
+
+  applyLayout();
+  return applyLayout;
+}
+
 function createDialogButton(parent, left, label) {
-  return blessed.box({
+  const baseWidth = Math.max(BUTTON_MIN_WIDTH, label.length + 4);
+  const button = blessed.box({
     parent,
     top: 7,
     left,
-    width: Math.max(12, label.length + 4),
+    width: baseWidth,
     height: 1,
     align: 'center',
     content: ` ${label} `,
@@ -75,6 +233,8 @@ function createDialogButton(parent, left, label) {
       hover: { fg: BUTTON_FG_ACTIVE, bg: BUTTON_BG_ACTIVE }
     }
   });
+  button._baseDialogWidth = baseWidth;
+  return button;
 }
 
 function createDialogTitleBadge(parent, title) {
@@ -96,6 +256,134 @@ function createDialogTitleBadge(parent, title) {
       bg: DIALOG_BG,
       border: { fg: DIALOG_FG, bg: DIALOG_BG }
     }
+  });
+}
+
+function showScrollableOutput(screen, text, labels = {}) {
+  return new Promise((resolve) => {
+    const dialogLabel = labels.dialogLabel || 'Output';
+    const hintText = labels.hintText || 'Esc/Enter close | Up/Down/PgUp/PgDn scroll';
+    const content = String(text || '');
+
+    const box = blessed.box({
+      parent: screen,
+      border: 'line',
+      width: '90%',
+      height: '80%',
+      top: 'center',
+      left: 'center',
+      keys: true,
+      mouse: true,
+      style: {
+        border: { fg: PRIMARY_COLOR, bg: DIALOG_BG },
+        bg: DIALOG_BG,
+        fg: DIALOG_FG
+      }
+    });
+    createDialogTitleBadge(box, dialogLabel);
+
+    const output = blessed.box({
+      parent: box,
+      border: 'line',
+      top: 1,
+      left: 2,
+      right: 2,
+      bottom: 3,
+      keys: true,
+      vi: true,
+      mouse: true,
+      scrollable: true,
+      alwaysScroll: true,
+      content: content.length > 0 ? content : ' ',
+      style: {
+        border: { fg: PRIMARY_COLOR, bg: DIALOG_BG },
+        bg: DIALOG_BG,
+        fg: DIALOG_FG
+      }
+    });
+
+    blessed.text({
+      parent: box,
+      left: 2,
+      right: 2,
+      bottom: 1,
+      height: 1,
+      content: hintText,
+      style: {
+        bg: DIALOG_BG,
+        fg: DIALOG_FG
+      }
+    });
+
+    let done = false;
+    function close() {
+      if (done) {
+        return;
+      }
+      done = true;
+      box.destroy();
+      screen.render();
+      resolve();
+    }
+
+    function handleKey(ch, key) {
+      if (done) {
+        return;
+      }
+
+      if (key && key.full === 'C-c') {
+        return;
+      }
+
+      const keyName = key ? key.name : '';
+      if (keyName === 'escape' || keyName === 'enter' || keyName === 'q' || keyName === 'Q' || ch === 'q' || ch === 'Q') {
+        close();
+        return;
+      }
+
+      if (keyName === 'up' || keyName === 'k') {
+        output.scroll(-1);
+        screen.render();
+        return;
+      }
+
+      if (keyName === 'down' || keyName === 'j') {
+        output.scroll(1);
+        screen.render();
+        return;
+      }
+
+      if (keyName === 'pageup') {
+        output.scroll(-Math.max(1, Math.floor(getNodeHeight(screen, output, 12) / 2)));
+        screen.render();
+        return;
+      }
+
+      if (keyName === 'pagedown') {
+        output.scroll(Math.max(1, Math.floor(getNodeHeight(screen, output, 12) / 2)));
+        screen.render();
+        return;
+      }
+
+      if (keyName === 'home') {
+        output.setScroll(0);
+        screen.render();
+        return;
+      }
+
+      if (keyName === 'end') {
+        output.setScrollPerc(100);
+        screen.render();
+      }
+    }
+
+    box.on('keypress', handleKey);
+    output.on('keypress', handleKey);
+    output.on('click', () => output.focus());
+    box.on('click', () => output.focus());
+
+    output.focus();
+    screen.render();
   });
 }
 
@@ -204,7 +492,7 @@ function askText(screen, question, initial = '', labels = {}) {
       clickable: true,
       autoFocus: false,
       style: {
-        border: { fg: 'green', bg: DIALOG_BG },
+        border: { fg: PRIMARY_COLOR, bg: DIALOG_BG },
         bg: DIALOG_BG
       }
     });
@@ -240,7 +528,14 @@ function askText(screen, question, initial = '', labels = {}) {
       (backBtn || nextBtn).left + (backBtn || nextBtn).width + 1,
       cancelLabel
     );
-    const buttonOrder = hasBack ? ['next', 'back', 'cancel'] : ['next', 'cancel'];
+    const layoutButtons = hasBack ? [backBtn, nextBtn, cancelBtn] : [nextBtn, cancelBtn];
+    const applyButtonLayout = bindDialogButtonLayout(
+      screen,
+      box,
+      layoutButtons,
+      { top: 7 }
+    );
+    const buttonOrder = hasBack ? ['back', 'next', 'cancel'] : ['next', 'cancel'];
 
     let done = false;
     let value = typeof initial === 'string' ? initial : '';
@@ -259,7 +554,7 @@ function askText(screen, question, initial = '', labels = {}) {
 
     function setActive(nextActive) {
       active = nextActive;
-      inputFrame.style.border.fg = active === 'input' ? 'green' : 'white';
+      inputFrame.style.border.fg = active === 'input' ? PRIMARY_COLOR : 'white';
       inputFrame.style.border.bg = DIALOG_BG;
       styleDialogButton(nextBtn, active === 'next');
       if (backBtn) {
@@ -489,6 +784,12 @@ function askYesNo(screen, text, labels = {}) {
     const yesBtn = createDialogButton(box, 2, yesLabel);
     const noBtn = createDialogButton(box, yesBtn.left + yesBtn.width + 1, noLabel);
     const backBtn = hasBack ? createDialogButton(box, noBtn.left + noBtn.width + 1, backLabel) : null;
+    const applyButtonLayout = bindDialogButtonLayout(
+      screen,
+      box,
+      [yesBtn, noBtn, backBtn],
+      { top: 6 }
+    );
     const buttonOrder = hasBack ? ['yes', 'no', 'back'] : ['yes', 'no'];
     let done = false;
     let active = 'yes';
@@ -650,7 +951,7 @@ function askSecret(screen, label, labels = {}) {
       clickable: true,
       autoFocus: false,
       style: {
-        border: { fg: 'green', bg: DIALOG_BG },
+        border: { fg: PRIMARY_COLOR, bg: DIALOG_BG },
         bg: DIALOG_BG
       }
     });
@@ -686,7 +987,14 @@ function askSecret(screen, label, labels = {}) {
       (backBtn || nextBtn).left + (backBtn || nextBtn).width + 1,
       cancelLabel
     );
-    const buttonOrder = hasBack ? ['next', 'back', 'cancel'] : ['next', 'cancel'];
+    const layoutButtons = hasBack ? [backBtn, nextBtn, cancelBtn] : [nextBtn, cancelBtn];
+    const applyButtonLayout = bindDialogButtonLayout(
+      screen,
+      box,
+      layoutButtons,
+      { top: 7 }
+    );
+    const buttonOrder = hasBack ? ['back', 'next', 'cancel'] : ['next', 'cancel'];
 
     let done = false;
     let value = '';
@@ -705,7 +1013,7 @@ function askSecret(screen, label, labels = {}) {
 
     function setActive(nextActive) {
       active = nextActive;
-      inputFrame.style.border.fg = active === 'input' ? 'green' : 'white';
+      inputFrame.style.border.fg = active === 'input' ? PRIMARY_COLOR : 'white';
       inputFrame.style.border.bg = DIALOG_BG;
       styleDialogButton(nextBtn, active === 'next');
       if (backBtn) {
@@ -930,7 +1238,7 @@ async function runTui({ state, hosts, saveState }) {
       width: '100%',
       align: 'center',
       content: i18n.t('appTitle'),
-      style: { fg: 'green' }
+      style: { fg: PRIMARY_COLOR }
     });
 
     const hostList = blessed.list({
@@ -979,7 +1287,7 @@ async function runTui({ state, hosts, saveState }) {
       left: 0,
       width: '100%',
       content: `${i18n.t('statusPrefix')}${i18n.t('statusReady')}`,
-      style: { border: { fg: 'green' } }
+      style: { border: { fg: PRIMARY_COLOR } }
     });
 
     const footer = blessed.box({
@@ -1046,6 +1354,18 @@ async function runTui({ state, hosts, saveState }) {
           nextLabel: i18n.t('btnNext'),
           cancelLabel: i18n.t('btnCancel'),
           backLabel: options.allowBack ? i18n.t('btnBack') : ''
+        });
+      } finally {
+        endModal();
+      }
+    }
+
+    async function showOutputModal(text, options = {}) {
+      beginModal();
+      try {
+        return await showScrollableOutput(screen, text, {
+          dialogLabel: options.dialogLabel || i18n.t('commandOutputTitle'),
+          hintText: options.hintText || i18n.t('commandOutputHint')
         });
       } finally {
         endModal();
@@ -1169,6 +1489,68 @@ async function runTui({ state, hosts, saveState }) {
       }
       status.setContent(`${i18n.t('statusPrefix')}${text}`);
       screen.render();
+    }
+
+    function buildCommandReport(host, command, result) {
+      const outputLimitKb = Math.floor(COMMAND_OUTPUT_LIMIT_BYTES / 1024);
+      const stdoutText = result.stdout && result.stdout.length > 0 ? result.stdout : i18n.t('commandNoOutput');
+      const stderrText = result.stderr && result.stderr.length > 0 ? result.stderr : i18n.t('commandNoOutput');
+      const codeText = result.code === null ? 'null' : String(result.code);
+      const lines = [
+        `${i18n.t('commandHost')}: ${host}`,
+        `$ ssh ${host} "${command}"`,
+        '',
+        `${i18n.t('commandStdout')}:`,
+        stdoutText,
+        '',
+        `${i18n.t('commandStderr')}:`,
+        stderrText,
+        '',
+        `${i18n.t('commandExitCode')}: ${codeText}`
+      ];
+
+      if (result.signal) {
+        lines.push(`${i18n.t('commandSignal')}: ${result.signal}`);
+      }
+      if (result.error) {
+        lines.push(`${i18n.t('commandSpawnError')}: ${result.error}`);
+      }
+      if (result.truncated) {
+        lines.push('', i18n.t('commandOutputTruncated', { limitKb: outputLimitKb }));
+      }
+
+      return lines.join('\n');
+    }
+
+    function buildCopyIdReport(host, result) {
+      const outputLimitKb = Math.floor(COMMAND_OUTPUT_LIMIT_BYTES / 1024);
+      const stdoutText = result.stdout && result.stdout.length > 0 ? result.stdout : i18n.t('commandNoOutput');
+      const stderrText = result.stderr && result.stderr.length > 0 ? result.stderr : i18n.t('commandNoOutput');
+      const codeText = result.code === null ? 'null' : String(result.code);
+      const lines = [
+        `${i18n.t('commandHost')}: ${host}`,
+        `$ ssh-copy-id ${host}`,
+        '',
+        `${i18n.t('commandStdout')}:`,
+        stdoutText,
+        '',
+        `${i18n.t('commandStderr')}:`,
+        stderrText,
+        '',
+        `${i18n.t('commandExitCode')}: ${codeText}`
+      ];
+
+      if (result.signal) {
+        lines.push(`${i18n.t('commandSignal')}: ${result.signal}`);
+      }
+      if (result.error) {
+        lines.push(`${i18n.t('copyIdSpawnError')}: ${result.error}`);
+      }
+      if (result.truncated) {
+        lines.push('', i18n.t('commandOutputTruncated', { limitKb: outputLimitKb }));
+      }
+
+      return lines.join('\n');
     }
 
     function syncTunnelStatuses() {
@@ -1675,6 +2057,202 @@ async function runTui({ state, hosts, saveState }) {
       finalize({ type: 'connect', host: target });
     }
 
+    async function resolveCommandTarget() {
+      if (focusLeft) {
+        const host = selectedHost();
+        if (!host) {
+          setStatus(i18n.t('noHosts'));
+          return null;
+        }
+        if (host.isPattern) {
+          const concrete = await askTextModal(i18n.t('connectPromptPattern'));
+          if (!concrete) {
+            return null;
+          }
+          return { host: concrete, usePassword: false };
+        }
+        return { host: host.name, usePassword: false };
+      }
+
+      const tunnel = selectedTunnel();
+      if (tunnel && tunnel.host) {
+        return { host: tunnel.host, usePassword: tunnel.auth === 'password' };
+      }
+
+      const host = selectedHost();
+      if (!host) {
+        setStatus(i18n.t('noHosts'));
+        return null;
+      }
+      if (host.isPattern) {
+        const concrete = await askTextModal(i18n.t('connectPromptPattern'));
+        if (!concrete) {
+          return null;
+        }
+        return { host: concrete, usePassword: false };
+      }
+      return { host: host.name, usePassword: false };
+    }
+
+    async function runCommandAndShowOutput() {
+      const target = await resolveCommandTarget();
+      if (!target || !target.host) {
+        return;
+      }
+      const host = target.host;
+
+      const command = await askTextModal(i18n.t('commandPrompt'), '', {
+        dialogLabel: i18n.t('runCommandDialogTitle')
+      });
+      if (!command) {
+        return;
+      }
+
+      let password = '';
+      if (target.usePassword) {
+        const entered = await askSecretModal(i18n.t('tunnelPasswordPrompt'), {
+          dialogLabel: i18n.t('runCommandDialogTitle')
+        });
+        if (!entered) {
+          return;
+        }
+        password = entered;
+      }
+
+      setStatus(i18n.t('commandRunning', { host, command }));
+      const result = await runSshCommand(host, command, {
+        outputLimitBytes: COMMAND_OUTPUT_LIMIT_BYTES,
+        password
+      });
+      await showOutputModal(buildCommandReport(host, command, result), {
+        dialogLabel: i18n.t('commandOutputTitle'),
+        hintText: i18n.t('commandOutputHint')
+      });
+
+      const statusCode = result.code === null
+        ? (result.signal ? `signal:${result.signal}` : 'null')
+        : String(result.code);
+      setStatus(i18n.t('commandFinished', { host, code: statusCode }));
+
+      if (focusLeft) {
+        hostList.focus();
+      } else {
+        tunnelList.focus();
+      }
+    }
+
+    async function runCopyIdAndShowOutput() {
+      const target = await resolveCommandTarget();
+      if (!target || !target.host) {
+        return;
+      }
+      const host = target.host;
+
+      let password = '';
+      let usePassword = Boolean(target.usePassword);
+      if (!usePassword) {
+        usePassword = await askYesNoModal(i18n.t('copyIdUsePasswordPrompt'), {
+          dialogLabel: i18n.t('copyIdDialogTitle')
+        });
+      }
+
+      if (usePassword) {
+        const entered = await askSecretModal(i18n.t('tunnelPasswordPrompt'), {
+          dialogLabel: i18n.t('copyIdDialogTitle')
+        });
+        if (!entered) {
+          return;
+        }
+        password = entered;
+      }
+
+      setStatus(i18n.t('copyIdRunning', { host }));
+      const result = await runSshCopyId(host, {
+        outputLimitBytes: COMMAND_OUTPUT_LIMIT_BYTES,
+        password
+      });
+      await showOutputModal(buildCopyIdReport(host, result), {
+        dialogLabel: i18n.t('copyIdOutputTitle'),
+        hintText: i18n.t('commandOutputHint')
+      });
+
+      const statusCode = result.code === null
+        ? (result.signal ? `signal:${result.signal}` : 'null')
+        : String(result.code);
+      setStatus(i18n.t('copyIdFinished', { host, code: statusCode }));
+
+      if (focusLeft) {
+        hostList.focus();
+      } else {
+        tunnelList.focus();
+      }
+    }
+
+    async function exportConfigFlow() {
+      const entered = await askTextModal(
+        i18n.t('configExportPathPrompt'),
+        defaultConfigExportPath(),
+        { dialogLabel: i18n.t('configExportDialogTitle') }
+      );
+      if (!entered) {
+        return;
+      }
+
+      const targetPath = resolveUserPath(entered);
+      if (!targetPath) {
+        setStatus(i18n.t('invalidInput'));
+        return;
+      }
+
+      exportConfigToFile(state, targetPath);
+      setStatus(i18n.t('configExported', { path: targetPath }));
+    }
+
+    async function importConfigFlow() {
+      const entered = await askTextModal(
+        i18n.t('configImportPathPrompt'),
+        path.join(STATE_DIR, 'config-export.json'),
+        { dialogLabel: i18n.t('configImportDialogTitle') }
+      );
+      if (!entered) {
+        return;
+      }
+
+      const sourcePath = resolveUserPath(entered);
+      if (!sourcePath) {
+        setStatus(i18n.t('invalidInput'));
+        return;
+      }
+
+      const confirm = await askYesNoModal(
+        i18n.t('configImportConfirm', { path: sourcePath }),
+        {
+          dialogLabel: i18n.t('configImportDialogTitle'),
+          yesLabel: i18n.t('yes'),
+          noLabel: i18n.t('no')
+        }
+      );
+      if (!confirm) {
+        return;
+      }
+
+      const imported = importConfigFromFile(sourcePath);
+      state.version = imported.version;
+      state.locale = imported.locale;
+      state.tunnels = imported.tunnels;
+      saveState(state);
+
+      locale = state.locale || locale;
+      rerenderAll();
+      applyFocusStyles();
+      if (focusLeft) {
+        hostList.focus();
+      } else {
+        tunnelList.focus();
+      }
+      setStatus(i18n.t('configImported', { path: sourcePath }));
+    }
+
     async function safeUiAction(handler) {
       try {
         await handler();
@@ -1699,11 +2277,11 @@ async function runTui({ state, hosts, saveState }) {
 
     function applyFocusStyles() {
       const inactiveColor = 'white';
-      hostList.style.border.fg = focusLeft ? 'green' : inactiveColor;
-      tunnelList.style.border.fg = focusLeft ? inactiveColor : 'green';
-      hostList.style.selected.bg = focusLeft ? 'green' : 'white';
+      hostList.style.border.fg = focusLeft ? PRIMARY_COLOR : inactiveColor;
+      tunnelList.style.border.fg = focusLeft ? inactiveColor : PRIMARY_COLOR;
+      hostList.style.selected.bg = focusLeft ? PRIMARY_COLOR : 'white';
       hostList.style.selected.fg = 'black';
-      tunnelList.style.selected.bg = focusLeft ? 'white' : 'green';
+      tunnelList.style.selected.bg = focusLeft ? 'white' : PRIMARY_COLOR;
       tunnelList.style.selected.fg = 'black';
     }
 
@@ -1741,6 +2319,11 @@ async function runTui({ state, hosts, saveState }) {
     screen.key(['r', 'к', 'R', 'К'], () => {
       finalize({ type: 'reload' });
     });
+
+    screen.key(['e', 'у', 'E', 'У'], () => safeUiAction(runCommandAndShowOutput));
+    screen.key(['i', 'ш', 'I', 'Ш'], () => safeUiAction(runCopyIdAndShowOutput));
+    screen.key(['o', 'щ', 'O', 'Щ'], () => safeUiAction(exportConfigFlow));
+    screen.key(['p', 'з', 'P', 'З'], () => safeUiAction(importConfigFlow));
 
     screen.key(['a', 'ф', 'A', 'Ф'], () => safeUiAction(async () => {
       if (focusLeft) {
