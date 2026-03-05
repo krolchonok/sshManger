@@ -20,7 +20,7 @@ const { HOME_DIR, STATE_DIR } = require('./paths');
 const DEFAULT_PRIMARY_COLOR = 'green';
 const ACCENT_COLOR_OPTIONS = ['green', 'cyan', 'blue', 'magenta', 'yellow', 'red', 'white'];
 let primaryColor = DEFAULT_PRIMARY_COLOR;
-const DIALOG_BG = 'black';
+const DIALOG_BG = 'default';
 const DIALOG_FG = 'white';
 const BUTTON_MIN_WIDTH = 12;
 const BUTTON_BG = 'white';
@@ -1225,14 +1225,9 @@ function markTunnelStatus(tunnel) {
 }
 
 async function runTui({ state, hosts, saveState }) {
-  const localeEnv = `${process.env.LC_ALL || ''} ${process.env.LC_CTYPE || ''} ${process.env.LANG || ''}`;
-  const isUtf8 = /UTF-?8/i.test(localeEnv);
   state.accentColor = normalizeAccentColor(state.accentColor);
   primaryColor = state.accentColor;
   let locale = state.locale || 'en';
-  if (!isUtf8) {
-    locale = 'en';
-  }
   let i18n = createI18n(locale);
 
   return new Promise((resolve) => {
