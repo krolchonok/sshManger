@@ -7,6 +7,7 @@ const { STATE_FILE, ensureDirs } = require('./paths');
 const DEFAULT_STATE = {
   version: 1,
   locale: 'en',
+  accentColor: 'green',
   tunnels: []
 };
 
@@ -26,7 +27,7 @@ function normalizeTunnel(item) {
     host: item.host || '',
     spec: item.spec || '',
     pid: Number.isInteger(item.pid) ? item.pid : null,
-    auth: item.auth === 'password' ? 'password' : 'agent',
+    auth: item.auth === 'password' ? 'password' : (item.auth === 'agent' ? 'agent' : 'auto'),
     createdAt: item.createdAt || nowIso(),
     updatedAt: item.updatedAt || nowIso(),
     logFile: item.logFile || '',
@@ -39,6 +40,9 @@ function normalizeState(state) {
   return {
     version: Number.isInteger(source.version) ? source.version : DEFAULT_STATE.version,
     locale: typeof source.locale === 'string' ? source.locale : DEFAULT_STATE.locale,
+    accentColor: typeof source.accentColor === 'string' && source.accentColor.trim()
+      ? source.accentColor.trim().toLowerCase()
+      : DEFAULT_STATE.accentColor,
     tunnels: Array.isArray(source.tunnels) ? source.tunnels.map(normalizeTunnel).filter(Boolean) : []
   };
 }

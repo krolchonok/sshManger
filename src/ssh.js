@@ -7,6 +7,8 @@ const { ASKPASS_DIR, LOG_DIR, ensureDirs } = require('./paths');
 const { nowIso } = require('./state');
 
 const DEFAULT_COMMAND_OUTPUT_LIMIT_BYTES = 200 * 1024;
+const DEFAULT_PROBE_OUTPUT_LIMIT_BYTES = 16 * 1024;
+const DEFAULT_PROBE_TIMEOUT_MS = 12_000;
 
 function isProcessAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) {
@@ -415,6 +417,182 @@ function buildLogPath(tunnelId) {
   return path.join(LOG_DIR, `tunnel-${safeId}.log`);
 }
 
+function appendTunnelLog(tunnel, message) {
+  try {
+    const tunnelId = tunnel && tunnel.id ? String(tunnel.id) : `unknown-${Date.now()}`;
+    const logFile = (tunnel && tunnel.logFile) ? tunnel.logFile : buildLogPath(tunnelId);
+    const text = String(message || '').trim();
+    fs.appendFileSync(logFile, `[${nowIso()}] ${text}\n`, 'utf8');
+    return logFile;
+  } catch (error) {
+    return '';
+  }
+}
+
+function isSshAuthFailureText(text) {
+  const lower = String(text || '').toLowerCase();
+  if (!lower) {
+    return false;
+  }
+  return (
+    lower.includes('permission denied') ||
+    lower.includes('authentication failed') ||
+    lower.includes('too many authentication failures') ||
+    lower.includes('no supported authentication methods available') ||
+    lower.includes('publickey') ||
+    lower.includes('keyboard-interactive')
+  );
+}
+
+function probeSshKeyAuth(host) {
+  return new Promise((resolve) => {
+    const targetHost = String(host || '').trim();
+    if (!targetHost) {
+      resolve({
+        ok: false,
+        authFailed: false,
+        error: 'Host is required',
+        stdout: '',
+        stderr: ''
+      });
+      return;
+    }
+
+    const stdoutChunks = [];
+    const stderrChunks = [];
+    let stdoutSize = 0;
+    let stderrSize = 0;
+    let totalCaptured = 0;
+    let done = false;
+
+    const finish = (result) => {
+      if (done) {
+        return;
+      }
+      done = true;
+      const stdout = Buffer.concat(stdoutChunks, stdoutSize).toString('utf8');
+      const stderr = Buffer.concat(stderrChunks, stderrSize).toString('utf8');
+      resolve({
+        ok: Boolean(result.ok),
+        authFailed: Boolean(result.authFailed),
+        code: typeof result.code === 'number' ? result.code : null,
+        signal: result.signal || null,
+        error: result.error || '',
+        stdout,
+        stderr
+      });
+    };
+
+    const args = [
+      '-n',
+      '-o',
+      'BatchMode=yes',
+      '-o',
+      'NumberOfPasswordPrompts=0',
+      '-o',
+      'PreferredAuthentications=publickey',
+      '-o',
+      'PasswordAuthentication=no',
+      '-o',
+      'KbdInteractiveAuthentication=no',
+      '-o',
+      'ConnectTimeout=8',
+      targetHost,
+      'exit'
+    ];
+
+    let child = null;
+    let probeTimeout = null;
+    try {
+      child = spawn('ssh', args, {
+        cwd: process.cwd(),
+        env: { ...process.env }
+      });
+    } catch (error) {
+      finish({
+        ok: false,
+        authFailed: false,
+        error: error.message
+      });
+      return;
+    }
+
+    probeTimeout = setTimeout(() => {
+      finish({
+        ok: false,
+        authFailed: false,
+        error: `SSH key auth probe timed out after ${DEFAULT_PROBE_TIMEOUT_MS}ms`
+      });
+      try {
+        child.kill();
+      } catch (error) {
+        // ignore kill errors for timeout path
+      }
+    }, DEFAULT_PROBE_TIMEOUT_MS);
+
+    if (child.stdout) {
+      child.stdout.on('data', (chunk) => {
+        const appended = appendLimitedChunk(
+          stdoutChunks,
+          stdoutSize,
+          chunk,
+          DEFAULT_PROBE_OUTPUT_LIMIT_BYTES - totalCaptured
+        );
+        stdoutSize = appended.totalSize;
+        totalCaptured += appended.addedBytes;
+      });
+    }
+
+    if (child.stderr) {
+      child.stderr.on('data', (chunk) => {
+        const appended = appendLimitedChunk(
+          stderrChunks,
+          stderrSize,
+          chunk,
+          DEFAULT_PROBE_OUTPUT_LIMIT_BYTES - totalCaptured
+        );
+        stderrSize = appended.totalSize;
+        totalCaptured += appended.addedBytes;
+      });
+    }
+
+    child.on('error', (error) => {
+      if (probeTimeout) {
+        clearTimeout(probeTimeout);
+      }
+      finish({
+        ok: false,
+        authFailed: false,
+        error: error.message
+      });
+    });
+
+    child.on('close', (code, signal) => {
+      if (probeTimeout) {
+        clearTimeout(probeTimeout);
+      }
+      const stdout = Buffer.concat(stdoutChunks, stdoutSize).toString('utf8');
+      const stderr = Buffer.concat(stderrChunks, stderrSize).toString('utf8');
+      if (code === 0) {
+        finish({
+          ok: true,
+          authFailed: false,
+          code,
+          signal
+        });
+        return;
+      }
+      finish({
+        ok: false,
+        authFailed: isSshAuthFailureText(`${stderr}\n${stdout}`),
+        code: typeof code === 'number' ? code : null,
+        signal: signal || null,
+        error: ''
+      });
+    });
+  });
+}
+
 function startTunnel(tunnel, password) {
   return new Promise((resolve, reject) => {
     let outFd = null;
@@ -442,14 +620,20 @@ function startTunnel(tunnel, password) {
       const env = { ...process.env };
 
       let askpassPath = '';
-      if (tunnel.auth === 'password') {
-        if (!password) {
-          throw new Error('Password is required for this tunnel');
-        }
-
+      if (password) {
         const askpass = createAskpassScript(password);
         askpassPath = askpass.filePath;
         Object.assign(env, askpass.env);
+        args.unshift(
+          '-o',
+          'BatchMode=no',
+          '-o',
+          'PreferredAuthentications=password,keyboard-interactive',
+          '-o',
+          'PubkeyAuthentication=no'
+        );
+      } else {
+        args.unshift('-o', 'BatchMode=yes');
       }
 
       const child = spawn('ssh', args, {
@@ -520,6 +704,8 @@ module.exports = {
   runInteractiveSsh,
   runSshCommand,
   runSshCopyId,
+  probeSshKeyAuth,
+  appendTunnelLog,
   startTunnel,
   stopTunnel,
   isProcessAlive,

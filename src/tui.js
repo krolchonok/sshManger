@@ -2,23 +2,37 @@
 
 const path = require('path');
 const blessed = require('blessed');
-const { createI18n, nextLocale } = require('./i18n');
-const { startTunnel, stopTunnel, isProcessAlive, buildTunnelSpec, runSshCommand, runSshCopyId } = require('./ssh');
+const { createI18n, getAvailableLocales, getLocaleMeta } = require('./i18n');
+const {
+  startTunnel,
+  stopTunnel,
+  isProcessAlive,
+  buildTunnelSpec,
+  runSshCommand,
+  runSshCopyId,
+  probeSshKeyAuth,
+  appendTunnelLog
+} = require('./ssh');
 const { loadHostsFromConfig, addHostToConfig, deleteHostFromConfig } = require('./sshConfig');
 const { nowIso, exportConfigToFile, importConfigFromFile } = require('./state');
 const { HOME_DIR, STATE_DIR } = require('./paths');
 
-const PRIMARY_COLOR = 'green';
+const DEFAULT_PRIMARY_COLOR = 'green';
+const ACCENT_COLOR_OPTIONS = ['green', 'cyan', 'blue', 'magenta', 'yellow', 'red', 'white'];
+let primaryColor = DEFAULT_PRIMARY_COLOR;
 const DIALOG_BG = 'black';
 const DIALOG_FG = 'white';
-const DIALOG_ACTIVE_FG = PRIMARY_COLOR;
 const BUTTON_MIN_WIDTH = 12;
 const BUTTON_BG = 'white';
-const BUTTON_BG_ACTIVE = PRIMARY_COLOR;
 const BUTTON_FG = 'black';
 const BUTTON_FG_ACTIVE = 'black';
 const DIALOG_BACK = '__dialog_back__';
 const COMMAND_OUTPUT_LIMIT_BYTES = 200 * 1024;
+
+function normalizeAccentColor(color) {
+  const normalized = String(color || '').trim().toLowerCase();
+  return ACCENT_COLOR_OPTIONS.includes(normalized) ? normalized : DEFAULT_PRIMARY_COLOR;
+}
 
 function hideTerminalCursor(screen) {
   if (!screen || !screen.program) {
@@ -76,7 +90,7 @@ function isPrintableInputChar(ch) {
 }
 
 function styleDialogButton(button, isActive) {
-  button.style.bg = isActive ? BUTTON_BG_ACTIVE : BUTTON_BG;
+  button.style.bg = isActive ? primaryColor : BUTTON_BG;
   button.style.fg = isActive ? BUTTON_FG_ACTIVE : BUTTON_FG;
 }
 
@@ -230,7 +244,7 @@ function createDialogButton(parent, left, label) {
     style: {
       fg: BUTTON_FG,
       bg: BUTTON_BG,
-      hover: { fg: BUTTON_FG_ACTIVE, bg: BUTTON_BG_ACTIVE }
+      hover: { fg: BUTTON_FG_ACTIVE, bg: primaryColor }
     }
   });
   button._baseDialogWidth = baseWidth;
@@ -263,6 +277,7 @@ function showScrollableOutput(screen, text, labels = {}) {
   return new Promise((resolve) => {
     const dialogLabel = labels.dialogLabel || 'Output';
     const hintText = labels.hintText || 'Esc/Enter close | Up/Down/PgUp/PgDn scroll';
+    const closeOnF1 = Boolean(labels.closeOnF1);
     const content = String(text || '');
 
     const box = blessed.box({
@@ -275,7 +290,7 @@ function showScrollableOutput(screen, text, labels = {}) {
       keys: true,
       mouse: true,
       style: {
-        border: { fg: PRIMARY_COLOR, bg: DIALOG_BG },
+        border: { fg: primaryColor, bg: DIALOG_BG },
         bg: DIALOG_BG,
         fg: DIALOG_FG
       }
@@ -296,7 +311,7 @@ function showScrollableOutput(screen, text, labels = {}) {
       alwaysScroll: true,
       content: content.length > 0 ? content : ' ',
       style: {
-        border: { fg: PRIMARY_COLOR, bg: DIALOG_BG },
+        border: { fg: primaryColor, bg: DIALOG_BG },
         bg: DIALOG_BG,
         fg: DIALOG_FG
       }
@@ -336,6 +351,10 @@ function showScrollableOutput(screen, text, labels = {}) {
       }
 
       const keyName = key ? key.name : '';
+      if (closeOnF1 && keyName === 'f1') {
+        close();
+        return;
+      }
       if (keyName === 'escape' || keyName === 'enter' || keyName === 'q' || keyName === 'Q' || ch === 'q' || ch === 'Q') {
         close();
         return;
@@ -492,7 +511,7 @@ function askText(screen, question, initial = '', labels = {}) {
       clickable: true,
       autoFocus: false,
       style: {
-        border: { fg: PRIMARY_COLOR, bg: DIALOG_BG },
+        border: { fg: primaryColor, bg: DIALOG_BG },
         bg: DIALOG_BG
       }
     });
@@ -554,7 +573,7 @@ function askText(screen, question, initial = '', labels = {}) {
 
     function setActive(nextActive) {
       active = nextActive;
-      inputFrame.style.border.fg = active === 'input' ? PRIMARY_COLOR : 'white';
+      inputFrame.style.border.fg = active === 'input' ? primaryColor : 'white';
       inputFrame.style.border.bg = DIALOG_BG;
       styleDialogButton(nextBtn, active === 'next');
       if (backBtn) {
@@ -951,7 +970,7 @@ function askSecret(screen, label, labels = {}) {
       clickable: true,
       autoFocus: false,
       style: {
-        border: { fg: PRIMARY_COLOR, bg: DIALOG_BG },
+        border: { fg: primaryColor, bg: DIALOG_BG },
         bg: DIALOG_BG
       }
     });
@@ -1013,7 +1032,7 @@ function askSecret(screen, label, labels = {}) {
 
     function setActive(nextActive) {
       active = nextActive;
-      inputFrame.style.border.fg = active === 'input' ? PRIMARY_COLOR : 'white';
+      inputFrame.style.border.fg = active === 'input' ? primaryColor : 'white';
       inputFrame.style.border.bg = DIALOG_BG;
       styleDialogButton(nextBtn, active === 'next');
       if (backBtn) {
@@ -1208,6 +1227,8 @@ function markTunnelStatus(tunnel) {
 async function runTui({ state, hosts, saveState }) {
   const localeEnv = `${process.env.LC_ALL || ''} ${process.env.LC_CTYPE || ''} ${process.env.LANG || ''}`;
   const isUtf8 = /UTF-?8/i.test(localeEnv);
+  state.accentColor = normalizeAccentColor(state.accentColor);
+  primaryColor = state.accentColor;
   let locale = state.locale || 'en';
   if (!isUtf8) {
     locale = 'en';
@@ -1230,27 +1251,16 @@ async function runTui({ state, hosts, saveState }) {
       screen.ignoreLocked.push('C-c');
     }
 
-    const title = blessed.box({
-      parent: screen,
-      top: 0,
-      left: 0,
-      height: 1,
-      width: '100%',
-      align: 'center',
-      content: i18n.t('appTitle'),
-      style: { fg: PRIMARY_COLOR }
-    });
-
     const hostList = blessed.list({
       parent: screen,
       label: ` ${i18n.t('hostPanel')} [${i18n.t('hostColumns')}] `,
       border: 'line',
-      top: 1,
+      top: 0,
       left: 0,
       width: '50%',
       height: 10,
-      keys: true,
-      vi: true,
+      keys: false,
+      vi: false,
       mouse: false,
       style: {
         selected: {
@@ -1264,12 +1274,12 @@ async function runTui({ state, hosts, saveState }) {
       parent: screen,
       label: ` ${i18n.t('tunnelPanel')} `,
       border: 'line',
-      top: 1,
+      top: 0,
       left: '50%',
       width: '50%',
       height: 10,
-      keys: true,
-      vi: true,
+      keys: false,
+      vi: false,
       mouse: false,
       style: {
         selected: {
@@ -1282,17 +1292,17 @@ async function runTui({ state, hosts, saveState }) {
     const status = blessed.box({
       parent: screen,
       border: 'line',
-      top: 11,
+      top: 10,
       height: 3,
       left: 0,
       width: '100%',
       content: `${i18n.t('statusPrefix')}${i18n.t('statusReady')}`,
-      style: { border: { fg: PRIMARY_COLOR } }
+      style: { border: { fg: primaryColor } }
     });
 
     const footer = blessed.box({
       parent: screen,
-      top: 14,
+      top: 13,
       height: 1,
       left: 0,
       width: '100%',
@@ -1365,7 +1375,8 @@ async function runTui({ state, hosts, saveState }) {
       try {
         return await showScrollableOutput(screen, text, {
           dialogLabel: options.dialogLabel || i18n.t('commandOutputTitle'),
-          hintText: options.hintText || i18n.t('commandOutputHint')
+          hintText: options.hintText || i18n.t('commandOutputHint'),
+          closeOnF1: Boolean(options.closeOnF1)
         });
       } finally {
         endModal();
@@ -1408,7 +1419,7 @@ async function runTui({ state, hosts, saveState }) {
 
     function applyLayout() {
       const compact = screen.width < 110 || screen.height < 26;
-      const titleHeight = 1;
+      const titleHeight = 0;
       const statusHeight = 3;
       const footerHeight = compact ? 2 : 1;
       const bodyHeight = Math.max(4, screen.height - titleHeight - statusHeight - footerHeight);
@@ -1448,7 +1459,7 @@ async function runTui({ state, hosts, saveState }) {
       footer.height = footerHeight;
       footer.left = 0;
       footer.width = '100%';
-      footer.setContent(i18n.t(compact ? 'footerKeysCompact' : 'footerKeys'));
+      footer.setContent(` ${i18n.t(compact ? 'footerKeysCompact' : 'footerKeys')}`);
     }
 
     function finalize(action) {
@@ -1604,7 +1615,9 @@ async function runTui({ state, hosts, saveState }) {
       tunnelList.setItems(
         state.tunnels.map((tunnel) => {
           const statusText = markTunnelStatus(tunnel) === 'running' ? i18n.t('stateRunning') : i18n.t('stateStopped');
-          const authText = tunnel.auth === 'password' ? i18n.t('authPassword') : i18n.t('authAgent');
+          const authText = tunnel.auth === 'password'
+            ? i18n.t('authPassword')
+            : (tunnel.auth === 'agent' ? i18n.t('authAgent') : i18n.t('authAuto'));
           return i18n.t('tunnelListFmt', {
             state: statusText,
             name: tunnel.name,
@@ -1620,13 +1633,14 @@ async function runTui({ state, hosts, saveState }) {
 
     function rerenderAll() {
       i18n = createI18n(locale);
-      title.setContent(i18n.t('appTitle'));
       hostList.setLabel(` ${i18n.t('hostPanel')} [${i18n.t('hostColumns')}] `);
       tunnelList.setLabel(` ${i18n.t('tunnelPanel')} `);
+      status.style.border.fg = primaryColor;
       applyLayout();
       syncTunnelStatuses();
       renderHosts();
       renderTunnels();
+      applyFocusStyles();
       setStatus(i18n.t('statusReady'));
     }
 
@@ -1639,8 +1653,7 @@ async function runTui({ state, hosts, saveState }) {
         localPort: null,
         remotePort: null,
         targetHost: '127.0.0.1',
-        targetPort: null,
-        usePassword: false
+        targetPort: null
       };
       let step = 'name';
 
@@ -1726,7 +1739,7 @@ async function runTui({ state, hosts, saveState }) {
             continue;
           }
           form.targetPort = value;
-          step = 'auth';
+          step = 'startNow';
           continue;
         }
 
@@ -1768,7 +1781,7 @@ async function runTui({ state, hosts, saveState }) {
             continue;
           }
           form.targetPort = value;
-          step = 'auth';
+          step = 'startNow';
           continue;
         }
 
@@ -1782,31 +1795,17 @@ async function runTui({ state, hosts, saveState }) {
             continue;
           }
           form.localPort = value;
-          step = 'auth';
-          continue;
-        }
-
-        if (step === 'auth') {
-          const value = await askAddStepConfirm(7, i18n.t('tunnelAuthPrompt'), { allowBack: true });
-          if (value === null) {
-            return;
-          }
-          if (isDialogBack(value)) {
-            step = form.type === 'L' ? 'lTargetPort' : (form.type === 'R' ? 'rTargetPort' : 'dLocalPort');
-            continue;
-          }
-          form.usePassword = Boolean(value);
           step = 'startNow';
           continue;
         }
 
         if (step === 'startNow') {
-          const startNow = await askAddStepConfirm(8, `${i18n.t('tunnelCreated')}. Start now?`, { allowBack: true });
+          const startNow = await askAddStepConfirm(7, `${i18n.t('tunnelCreated')}. Start now?`, { allowBack: true });
           if (startNow === null) {
             return;
           }
           if (isDialogBack(startNow)) {
-            step = 'auth';
+            step = form.type === 'L' ? 'lTargetPort' : (form.type === 'R' ? 'rTargetPort' : 'dLocalPort');
             continue;
           }
 
@@ -1830,7 +1829,7 @@ async function runTui({ state, hosts, saveState }) {
             host: form.host,
             spec: buildTunnelSpec(form.type, config),
             pid: null,
-            auth: form.usePassword ? 'password' : 'agent',
+            auth: 'auto',
             createdAt: nowIso(),
             updatedAt: nowIso(),
             logFile: '',
@@ -1940,16 +1939,48 @@ async function runTui({ state, hosts, saveState }) {
         return;
       }
 
-      let password = null;
-      if (tunnel.auth === 'password') {
-        password = await askSecretModal(i18n.t('tunnelPasswordPrompt'));
-        if (!password) {
-          return;
-        }
-      }
-
       try {
+        setStatus(i18n.t('tunnelStarting'));
+        const activeLogFile = appendTunnelLog(
+          tunnel,
+          `Tunnel start requested: host=${tunnel.host} type=${tunnel.type} spec=${tunnel.spec}`
+        );
+        if (activeLogFile && tunnel.logFile !== activeLogFile) {
+          tunnel.logFile = activeLogFile;
+          saveState(state);
+        }
+
+        appendTunnelLog(tunnel, 'Checking SSH key authentication');
+        setStatus(i18n.t('tunnelCheckingAuth'));
+        let password = '';
+        const keyProbe = await probeSshKeyAuth(tunnel.host);
+        if (!keyProbe.ok) {
+          appendTunnelLog(
+            tunnel,
+            `Key auth probe failed: authFailed=${keyProbe.authFailed} code=${keyProbe.code} signal=${keyProbe.signal} error=${keyProbe.error || '-'}`
+          );
+          const probeDetails = (keyProbe.stderr || keyProbe.stdout || keyProbe.error || '').trim();
+          if (probeDetails) {
+            appendTunnelLog(tunnel, `Key auth probe details: ${probeDetails}`);
+          }
+          if (!keyProbe.authFailed) {
+            throw new Error(probeDetails || 'Unable to verify key authentication');
+          }
+          appendTunnelLog(tunnel, 'Falling back to password prompt');
+          setStatus(i18n.t('tunnelWaitingPassword'));
+          const entered = await askSecretModal(i18n.t('tunnelPasswordPrompt'));
+          if (!entered) {
+            appendTunnelLog(tunnel, 'Password prompt cancelled by user');
+            return;
+          }
+          password = entered;
+          appendTunnelLog(tunnel, 'Password entered, starting tunnel with password auth');
+        } else {
+          appendTunnelLog(tunnel, 'Key auth probe succeeded, starting tunnel with key/agent auth');
+        }
+
         const started = await startTunnel(tunnel, password);
+        appendTunnelLog(tunnel, `Tunnel started successfully (pid=${started.pid})`);
         tunnel.pid = started.pid;
         tunnel.logFile = started.logFile;
         tunnel.updatedAt = started.updatedAt;
@@ -1958,6 +1989,7 @@ async function runTui({ state, hosts, saveState }) {
         renderTunnels();
         setStatus(i18n.t('tunnelStarted'));
       } catch (error) {
+        appendTunnelLog(tunnel, `Tunnel start failed: ${error.message}`);
         tunnel.lastError = error.message;
         saveState(state);
         setStatus(`${i18n.t('tunnelStartFailed')}: ${error.message}`);
@@ -2239,10 +2271,12 @@ async function runTui({ state, hosts, saveState }) {
       const imported = importConfigFromFile(sourcePath);
       state.version = imported.version;
       state.locale = imported.locale;
+      state.accentColor = normalizeAccentColor(imported.accentColor);
       state.tunnels = imported.tunnels;
       saveState(state);
 
       locale = state.locale || locale;
+      primaryColor = normalizeAccentColor(state.accentColor);
       rerenderAll();
       applyFocusStyles();
       if (focusLeft) {
@@ -2251,6 +2285,704 @@ async function runTui({ state, hosts, saveState }) {
         tunnelList.focus();
       }
       setStatus(i18n.t('configImported', { path: sourcePath }));
+    }
+
+    async function showSettingsMenu() {
+      beginModal();
+      try {
+        return await new Promise((resolve) => {
+          const box = blessed.box({
+            parent: screen,
+            border: 'line',
+            label: ` ${i18n.t('settingsMenuTitle')} `,
+            width: '60%',
+            height: 14,
+            top: 'center',
+            left: 'center',
+            keys: true,
+            mouse: true,
+            style: {
+              border: { fg: primaryColor, bg: DIALOG_BG },
+              bg: DIALOG_BG,
+              fg: DIALOG_FG
+            }
+          });
+
+          const hint = blessed.text({
+            parent: box,
+            top: 1,
+            left: 2,
+            content: i18n.t('settingsMenuHint'),
+            style: {
+              bg: DIALOG_BG,
+              fg: DIALOG_FG
+            }
+          });
+
+          const items = [
+            { key: 'language', title: i18n.t('settingsItemLanguage') },
+            { key: 'accent', title: i18n.t('settingsItemAccent') },
+            { key: 'import', title: i18n.t('settingsItemImport') },
+            { key: 'export', title: i18n.t('settingsItemExport') },
+            { key: 'reload', title: i18n.t('settingsItemReload') }
+          ];
+
+          const list = blessed.list({
+            parent: box,
+            border: 'line',
+            top: 3,
+            left: 2,
+            height: 6,
+            keys: false,
+            vi: false,
+            loop: true,
+            mouse: true,
+            items: items.map((item, idx) => `${idx + 1}. ${item.title}`),
+            style: {
+              selected: { bg: primaryColor, fg: 'black' },
+              border: { fg: 'white', bg: DIALOG_BG },
+              bg: DIALOG_BG,
+              fg: DIALOG_FG
+            }
+          });
+
+          const closeBtn = createDialogButton(box, 0, i18n.t('btnClose'));
+          const applySettingsLayout = () => {
+            hint.left = 2;
+            hint.right = 2;
+            hint.width = undefined;
+            list.left = 2;
+            list.right = 2;
+            list.width = undefined;
+            closeBtn.top = 10;
+            closeBtn.left = 2;
+            closeBtn.right = 2;
+            closeBtn.width = undefined;
+          };
+          const onSettingsResize = () => {
+            if (box.detached) {
+              return;
+            }
+            applySettingsLayout();
+            screen.render();
+          };
+          screen.on('resize', onSettingsResize);
+          box.on('destroy', () => {
+            if (typeof screen.off === 'function') {
+              screen.off('resize', onSettingsResize);
+              return;
+            }
+            screen.removeListener('resize', onSettingsResize);
+          });
+          applySettingsLayout();
+
+          let done = false;
+          let active = 'list';
+
+          function finish(value) {
+            if (done) {
+              return;
+            }
+            done = true;
+            box.destroy();
+            screen.render();
+            resolve(value);
+          }
+
+          function setActive(nextActive) {
+            active = nextActive;
+            list.style.border.fg = active === 'list' ? primaryColor : 'white';
+            styleDialogButton(closeBtn, active === 'close');
+            screen.render();
+          }
+
+          function moveListSelection(delta) {
+            if (!items.length) {
+              return;
+            }
+            const current = Number.isInteger(list.selected) ? list.selected : 0;
+            const safeCurrent = Math.max(0, Math.min(current, items.length - 1));
+            const next = (safeCurrent + delta + items.length) % items.length;
+            list.select(next);
+            screen.render();
+          }
+
+          function selectedKey() {
+            const idx = Math.max(0, Math.min(items.length - 1, list.selected));
+            return items[idx].key;
+          }
+
+          function handleSelect() {
+            finish(selectedKey());
+          }
+
+          function cycleForward() {
+            if (active === 'list') {
+              setActive('close');
+            } else {
+              setActive('list');
+            }
+          }
+
+          function cycleBackward() {
+            if (active === 'list') {
+              setActive('close');
+            } else {
+              setActive('list');
+            }
+          }
+
+          function handleKey(ch, key) {
+            if (done) {
+              return;
+            }
+            if (key && key.full === 'C-c') {
+              return;
+            }
+            if (key && key.name === 'escape') {
+              finish(null);
+              return;
+            }
+            if (key && key.name === 'tab') {
+              cycleForward();
+              return;
+            }
+            if (key && key.name === 'S-tab') {
+              cycleBackward();
+              return;
+            }
+
+            if (key && key.name === 'enter') {
+              if (active === 'close') {
+                finish(null);
+                return;
+              }
+              handleSelect();
+              return;
+            }
+
+            if (active === 'list' && key && (key.name === 'up' || key.name === 'k')) {
+              moveListSelection(-1);
+              return;
+            }
+            if (active === 'list' && key && (key.name === 'down' || key.name === 'j')) {
+              moveListSelection(1);
+              return;
+            }
+
+            if (ch && /^\d$/.test(ch)) {
+              const numeric = Number(ch);
+              if (numeric >= 1 && numeric <= items.length) {
+                list.select(numeric - 1);
+                handleSelect();
+              }
+            }
+          }
+
+          box.on('keypress', handleKey);
+          list.on('keypress', handleKey);
+          closeBtn.on('keypress', handleKey);
+
+          list.on('click', () => {
+            setActive('list');
+          });
+          closeBtn.on('click', () => {
+            setActive('close');
+            finish(null);
+          });
+
+          box.focus();
+          list.focus();
+          list.select(0);
+          setActive('list');
+        });
+      } finally {
+        endModal();
+      }
+    }
+
+    function applyReload() {
+      finalize({ type: 'reload' });
+    }
+
+    function formatLocaleLabel(code) {
+      const meta = getLocaleMeta(code);
+      if (meta.nativeName && meta.name && meta.nativeName !== meta.name) {
+        return `${meta.nativeName} (${meta.name})`;
+      }
+      return meta.nativeName || meta.name || code;
+    }
+
+    function formatAccentColorLabel(code) {
+      return i18n.t(`accentColor.${code}`);
+    }
+
+    async function showLanguageMenu() {
+      beginModal();
+      try {
+        return await new Promise((resolve) => {
+          const available = getAvailableLocales();
+          const box = blessed.box({
+            parent: screen,
+            border: 'line',
+            width: '60%',
+            height: 14,
+            top: 'center',
+            left: 'center',
+            keys: true,
+            mouse: true,
+            style: {
+              border: { fg: primaryColor, bg: DIALOG_BG },
+              bg: DIALOG_BG,
+              fg: DIALOG_FG
+            }
+          });
+          createDialogTitleBadge(box, i18n.t('languageMenuTitle'));
+
+          const hint = blessed.text({
+            parent: box,
+            top: 1,
+            left: 2,
+            content: i18n.t('languageMenuHint'),
+            style: {
+              bg: DIALOG_BG,
+              fg: DIALOG_FG
+            }
+          });
+
+          const items = available.map((code, idx) => ({
+            key: code,
+            title: `${idx + 1}. ${formatLocaleLabel(code)}`
+          }));
+
+          const list = blessed.list({
+            parent: box,
+            border: 'line',
+            top: 3,
+            left: 2,
+            height: 6,
+            keys: false,
+            vi: false,
+            loop: true,
+            mouse: true,
+            items: items.map((item) => item.title),
+            style: {
+              selected: { bg: primaryColor, fg: 'black' },
+              border: { fg: 'white', bg: DIALOG_BG },
+              bg: DIALOG_BG,
+              fg: DIALOG_FG
+            }
+          });
+
+          const closeBtn = createDialogButton(box, 0, i18n.t('btnClose'));
+          const applyLanguageLayout = () => {
+            hint.left = 2;
+            hint.right = 2;
+            hint.width = undefined;
+            list.left = 2;
+            list.right = 2;
+            list.width = undefined;
+            closeBtn.top = 10;
+            closeBtn.left = 2;
+            closeBtn.right = 2;
+            closeBtn.width = undefined;
+          };
+          const onLanguageResize = () => {
+            if (box.detached) {
+              return;
+            }
+            applyLanguageLayout();
+            screen.render();
+          };
+          screen.on('resize', onLanguageResize);
+          box.on('destroy', () => {
+            if (typeof screen.off === 'function') {
+              screen.off('resize', onLanguageResize);
+              return;
+            }
+            screen.removeListener('resize', onLanguageResize);
+          });
+          applyLanguageLayout();
+
+          let done = false;
+          let active = 'list';
+
+          function finish(value) {
+            if (done) {
+              return;
+            }
+            done = true;
+            box.destroy();
+            screen.render();
+            resolve(value);
+          }
+
+          function setActive(nextActive) {
+            active = nextActive;
+            list.style.border.fg = active === 'list' ? primaryColor : 'white';
+            styleDialogButton(closeBtn, active === 'close');
+            screen.render();
+          }
+
+          function moveListSelection(delta) {
+            if (!items.length) {
+              return;
+            }
+            const current = Number.isInteger(list.selected) ? list.selected : 0;
+            const safeCurrent = Math.max(0, Math.min(current, items.length - 1));
+            const next = (safeCurrent + delta + items.length) % items.length;
+            list.select(next);
+            screen.render();
+          }
+
+          function selectedLocale() {
+            const idx = Math.max(0, Math.min(items.length - 1, list.selected));
+            return items[idx].key;
+          }
+
+          function cycleFocus() {
+            if (active === 'list') {
+              setActive('close');
+            } else {
+              setActive('list');
+            }
+          }
+
+          function handleKey(ch, key) {
+            if (done) {
+              return;
+            }
+            if (key && key.full === 'C-c') {
+              return;
+            }
+            if (key && key.name === 'escape') {
+              finish(null);
+              return;
+            }
+            if (key && (key.name === 'tab' || key.name === 'S-tab')) {
+              cycleFocus();
+              return;
+            }
+
+            if (key && key.name === 'enter') {
+              if (active === 'close') {
+                finish(null);
+                return;
+              }
+              finish(selectedLocale());
+              return;
+            }
+
+            if (active === 'list' && key && (key.name === 'up' || key.name === 'k')) {
+              moveListSelection(-1);
+              return;
+            }
+            if (active === 'list' && key && (key.name === 'down' || key.name === 'j')) {
+              moveListSelection(1);
+              return;
+            }
+
+            if (ch && /^\d$/.test(ch)) {
+              const numeric = Number(ch);
+              if (numeric >= 1 && numeric <= items.length) {
+                list.select(numeric - 1);
+                finish(selectedLocale());
+              }
+            }
+          }
+
+          box.on('keypress', handleKey);
+          list.on('keypress', handleKey);
+          closeBtn.on('keypress', handleKey);
+          list.on('click', () => setActive('list'));
+          closeBtn.on('click', () => {
+            setActive('close');
+            finish(null);
+          });
+
+          box.focus();
+          list.focus();
+          const currentIdx = Math.max(0, available.indexOf(locale));
+          list.select(currentIdx);
+          setActive('list');
+        });
+      } finally {
+        endModal();
+      }
+    }
+
+    async function openLanguageMenuFlow() {
+      const selected = await showLanguageMenu();
+      if (!selected || selected === locale) {
+        return;
+      }
+      locale = selected;
+      state.locale = locale;
+      saveState(state);
+      rerenderAll();
+      setStatus(i18n.t('languageSet', { lang: formatLocaleLabel(locale) }));
+    }
+
+    async function showAccentColorMenu() {
+      beginModal();
+      try {
+        return await new Promise((resolve) => {
+          const available = ACCENT_COLOR_OPTIONS;
+          const box = blessed.box({
+            parent: screen,
+            border: 'line',
+            width: '60%',
+            height: 14,
+            top: 'center',
+            left: 'center',
+            keys: true,
+            mouse: true,
+            style: {
+              border: { fg: primaryColor, bg: DIALOG_BG },
+              bg: DIALOG_BG,
+              fg: DIALOG_FG
+            }
+          });
+          createDialogTitleBadge(box, i18n.t('accentMenuTitle'));
+
+          const hint = blessed.text({
+            parent: box,
+            top: 1,
+            left: 2,
+            content: i18n.t('accentMenuHint'),
+            style: {
+              bg: DIALOG_BG,
+              fg: DIALOG_FG
+            }
+          });
+
+          const items = available.map((code, idx) => ({
+            key: code,
+            title: `${idx + 1}. ${formatAccentColorLabel(code)}`
+          }));
+
+          const list = blessed.list({
+            parent: box,
+            border: 'line',
+            top: 3,
+            left: 2,
+            height: 6,
+            keys: false,
+            vi: false,
+            loop: true,
+            mouse: true,
+            items: items.map((item) => item.title),
+            style: {
+              selected: { bg: primaryColor, fg: 'black' },
+              border: { fg: 'white', bg: DIALOG_BG },
+              bg: DIALOG_BG,
+              fg: DIALOG_FG
+            }
+          });
+
+          const closeBtn = createDialogButton(box, 0, i18n.t('btnClose'));
+          const applyAccentLayout = () => {
+            hint.left = 2;
+            hint.right = 2;
+            hint.width = undefined;
+            list.left = 2;
+            list.right = 2;
+            list.width = undefined;
+            closeBtn.top = 10;
+            closeBtn.left = 2;
+            closeBtn.right = 2;
+            closeBtn.width = undefined;
+          };
+          const onAccentResize = () => {
+            if (box.detached) {
+              return;
+            }
+            applyAccentLayout();
+            screen.render();
+          };
+          screen.on('resize', onAccentResize);
+          box.on('destroy', () => {
+            if (typeof screen.off === 'function') {
+              screen.off('resize', onAccentResize);
+              return;
+            }
+            screen.removeListener('resize', onAccentResize);
+          });
+          applyAccentLayout();
+
+          let done = false;
+          let active = 'list';
+
+          function finish(value) {
+            if (done) {
+              return;
+            }
+            done = true;
+            box.destroy();
+            screen.render();
+            resolve(value);
+          }
+
+          function setActive(nextActive) {
+            active = nextActive;
+            list.style.border.fg = active === 'list' ? primaryColor : 'white';
+            styleDialogButton(closeBtn, active === 'close');
+            screen.render();
+          }
+
+          function moveListSelection(delta) {
+            if (!items.length) {
+              return;
+            }
+            const current = Number.isInteger(list.selected) ? list.selected : 0;
+            const safeCurrent = Math.max(0, Math.min(current, items.length - 1));
+            const next = (safeCurrent + delta + items.length) % items.length;
+            list.select(next);
+            screen.render();
+          }
+
+          function selectedColor() {
+            const idx = Math.max(0, Math.min(items.length - 1, list.selected));
+            return items[idx].key;
+          }
+
+          function cycleFocus() {
+            if (active === 'list') {
+              setActive('close');
+            } else {
+              setActive('list');
+            }
+          }
+
+          function handleKey(ch, key) {
+            if (done) {
+              return;
+            }
+            if (key && key.full === 'C-c') {
+              return;
+            }
+            if (key && key.name === 'escape') {
+              finish(null);
+              return;
+            }
+            if (key && (key.name === 'tab' || key.name === 'S-tab')) {
+              cycleFocus();
+              return;
+            }
+            if (key && key.name === 'enter') {
+              if (active === 'close') {
+                finish(null);
+                return;
+              }
+              finish(selectedColor());
+              return;
+            }
+
+            if (active === 'list' && key && (key.name === 'up' || key.name === 'k')) {
+              moveListSelection(-1);
+              return;
+            }
+            if (active === 'list' && key && (key.name === 'down' || key.name === 'j')) {
+              moveListSelection(1);
+              return;
+            }
+            if (ch && /^\d$/.test(ch)) {
+              const numeric = Number(ch);
+              if (numeric >= 1 && numeric <= items.length) {
+                list.select(numeric - 1);
+                finish(selectedColor());
+              }
+            }
+          }
+
+          box.on('keypress', handleKey);
+          list.on('keypress', handleKey);
+          closeBtn.on('keypress', handleKey);
+          list.on('click', () => setActive('list'));
+          closeBtn.on('click', () => {
+            setActive('close');
+            finish(null);
+          });
+
+          box.focus();
+          list.focus();
+          const currentIdx = Math.max(0, available.indexOf(primaryColor));
+          list.select(currentIdx);
+          setActive('list');
+        });
+      } finally {
+        endModal();
+      }
+    }
+
+    async function openAccentColorMenuFlow() {
+      const selected = await showAccentColorMenu();
+      if (!selected || selected === primaryColor) {
+        return;
+      }
+      primaryColor = normalizeAccentColor(selected);
+      state.accentColor = primaryColor;
+      saveState(state);
+      rerenderAll();
+      setStatus(i18n.t('accentSet', { color: formatAccentColorLabel(primaryColor) }));
+    }
+
+    async function openSettingsMenuFlow() {
+      try {
+        const choice = await showSettingsMenu();
+        if (!choice) {
+          return;
+        }
+        if (choice === 'language') {
+          await openLanguageMenuFlow();
+          return;
+        }
+        if (choice === 'accent') {
+          await openAccentColorMenuFlow();
+          return;
+        }
+        if (choice === 'import') {
+          await importConfigFlow();
+          return;
+        }
+        if (choice === 'export') {
+          await exportConfigFlow();
+          return;
+        }
+        if (choice === 'reload') {
+          applyReload();
+        }
+      } finally {
+        if (!closing) {
+          if (focusLeft) {
+            hostList.focus();
+          } else {
+            tunnelList.focus();
+          }
+          applyFocusStyles();
+          screen.render();
+        }
+      }
+    }
+
+    async function openShortcutsHelpFlow() {
+      await showOutputModal(i18n.t('shortcutsHelpBody'), {
+        dialogLabel: i18n.t('shortcutsHelpTitle'),
+        hintText: i18n.t('shortcutsHelpHint'),
+        closeOnF1: true
+      });
+    }
+
+    async function toggleSelectedTunnelState() {
+      const tunnel = selectedTunnel();
+      if (!tunnel) {
+        return;
+      }
+      if (tunnel.pid && isProcessAlive(tunnel.pid)) {
+        await stopSelectedTunnel();
+        return;
+      }
+      await startSelectedTunnel();
     }
 
     async function safeUiAction(handler) {
@@ -2275,13 +3007,32 @@ async function runTui({ state, hosts, saveState }) {
       screen.render();
     }
 
+    function getFocusedListAndCount() {
+      if (focusLeft) {
+        return { list: hostList, count: hostRows.length };
+      }
+      return { list: tunnelList, count: Array.isArray(state.tunnels) ? state.tunnels.length : 0 };
+    }
+
+    function moveFocusedSelection(delta) {
+      const { list, count } = getFocusedListAndCount();
+      if (!count) {
+        return;
+      }
+      const current = Number.isInteger(list.selected) ? list.selected : 0;
+      const safeCurrent = Math.max(0, Math.min(current, count - 1));
+      const next = (safeCurrent + delta + count) % count;
+      list.select(next);
+      screen.render();
+    }
+
     function applyFocusStyles() {
       const inactiveColor = 'white';
-      hostList.style.border.fg = focusLeft ? PRIMARY_COLOR : inactiveColor;
-      tunnelList.style.border.fg = focusLeft ? inactiveColor : PRIMARY_COLOR;
-      hostList.style.selected.bg = focusLeft ? PRIMARY_COLOR : 'white';
+      hostList.style.border.fg = focusLeft ? primaryColor : inactiveColor;
+      tunnelList.style.border.fg = focusLeft ? inactiveColor : primaryColor;
+      hostList.style.selected.bg = focusLeft ? primaryColor : 'white';
       hostList.style.selected.fg = 'black';
-      tunnelList.style.selected.bg = focusLeft ? 'white' : PRIMARY_COLOR;
+      tunnelList.style.selected.bg = focusLeft ? 'white' : primaryColor;
       tunnelList.style.selected.fg = 'black';
     }
 
@@ -2295,6 +3046,8 @@ async function runTui({ state, hosts, saveState }) {
     });
 
     screen.key(['tab'], () => switchFocus());
+    screen.key(['up', 'k'], () => moveFocusedSelection(-1));
+    screen.key(['down', 'j'], () => moveFocusedSelection(1));
     screen.key(['h', 'р', 'H', 'Р'], () => {
       focusLeft = true;
       hostList.focus();
@@ -2308,22 +3061,10 @@ async function runTui({ state, hosts, saveState }) {
       screen.render();
     });
 
-    screen.key(['l', 'д', 'L', 'Д'], () => {
-      locale = nextLocale(locale);
-      state.locale = locale;
-      saveState(state);
-      rerenderAll();
-      setStatus(i18n.t('languageSet', { lang: locale }));
-    });
-
-    screen.key(['r', 'к', 'R', 'К'], () => {
-      finalize({ type: 'reload' });
-    });
-
     screen.key(['e', 'у', 'E', 'У'], () => safeUiAction(runCommandAndShowOutput));
     screen.key(['i', 'ш', 'I', 'Ш'], () => safeUiAction(runCopyIdAndShowOutput));
-    screen.key(['o', 'щ', 'O', 'Щ'], () => safeUiAction(exportConfigFlow));
-    screen.key(['p', 'з', 'P', 'З'], () => safeUiAction(importConfigFlow));
+    screen.key(['m', 'ь', 'M', 'Ь'], () => safeUiAction(openSettingsMenuFlow));
+    screen.key(['f1', '?'], () => safeUiAction(openShortcutsHelpFlow));
 
     screen.key(['a', 'ф', 'A', 'Ф'], () => safeUiAction(async () => {
       if (focusLeft) {
@@ -2341,10 +3082,15 @@ async function runTui({ state, hosts, saveState }) {
       }
       await deleteSelectedTunnel();
     }));
-    screen.key(['c', 'с', 'C', 'С', 'enter'], () => safeUiAction(async () => {
-      if (!focusLeft) {
+    screen.key(['enter'], () => safeUiAction(async () => {
+      if (focusLeft) {
+        await connectSelectedHost();
         return;
       }
+      await toggleSelectedTunnelState();
+    }));
+
+    screen.key(['c', 'с', 'C', 'С'], () => safeUiAction(async () => {
       await connectSelectedHost();
     }));
 

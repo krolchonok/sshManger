@@ -1,192 +1,47 @@
 'use strict';
 
-const TRANSLATIONS = {
-  en: {
-    appTitle: 'SSHHelper',
-    hostPanel: 'Hosts from ~/.ssh/config',
-    hostColumns: 'Alias | URL | Port',
-    tunnelPanel: 'Tunnels',
-    statusReady: 'Ready',
-    footerKeys:
-      'Tab switch panel | Enter/C connect | A add selected | S start | X stop | D delete selected | E remote cmd | I copy-id | O export cfg | P import cfg | R reload | L language | Q quit',
-    footerKeysCompact:
-      'Tab switch | Enter/C connect | A add selected | S start | X stop | D del selected | E cmd | I copy-id | O exp | P imp | R reload | L lang | Q quit',
-    noHosts: 'No hosts found in ~/.ssh/config',
-    noTunnels: 'No tunnels yet. Press A to add one.',
-    connectPromptPattern: 'Selected host is a pattern. Enter concrete hostname',
-    connectPromptManual: 'Enter host alias or hostname',
-    addTunnelTitle: 'Create tunnel',
-    addTunnelStep: 'Add tunnel - Step {step}',
-    addHostStep: 'Add host - Step {step}',
-    hostAliasPrompt: 'Host alias',
-    hostNamePrompt: 'HostName',
-    hostUserPrompt: 'User',
-    hostPortPrompt: 'Port',
-    tunnelNamePrompt: 'Tunnel name (label)',
-    tunnelTypePrompt: 'Tunnel type (L/R/D)',
-    tunnelHostPrompt: 'SSH host alias or hostname',
-    tunnelLocalPortPrompt: 'Local port',
-    tunnelRemotePortPrompt: 'Remote port',
-    tunnelTargetHostPrompt: 'Target host',
-    tunnelTargetPortPrompt: 'Target port',
-    tunnelAuthPrompt: 'Use password auth for this tunnel?',
-    tunnelPasswordPrompt: 'Password (not saved)',
-    tunnelCreated: 'Tunnel saved',
-    tunnelStarted: 'Tunnel started',
-    tunnelStopped: 'Tunnel stopped',
-    tunnelDeleted: 'Tunnel deleted',
-    hostAdded: 'Host added to ~/.ssh/config',
-    hostDeleted: 'Host deleted from ~/.ssh/config',
-    tunnelStartFailed: 'Failed to start tunnel',
-    tunnelStopFailed: 'Failed to stop tunnel',
-    invalidInput: 'Invalid input',
-    sshExitCode: 'SSH session ended with code {code}',
-    launchingSsh: 'Launching ssh {host}',
-    reloadDone: 'Reloaded hosts and tunnel status',
-    languageSet: 'Language switched to {lang}',
-    confirmDelete: 'Delete selected tunnel record?',
-    deleteDialogTitle: 'Delete tunnel',
-    confirmDeleteHost: 'Delete host "{host}" from ~/.ssh/config?',
-    deleteHostDialogTitle: 'Delete host',
-    runCommandDialogTitle: 'Run remote command',
-    commandPrompt: 'Remote command to execute',
-    commandOutputTitle: 'Command output',
-    commandOutputHint: 'Esc/Enter close | Up/Down/PgUp/PgDn scroll',
-    commandRunning: 'Running on {host}: {command}',
-    commandFinished: 'Command on {host} completed (code: {code})',
-    commandHost: 'Host',
-    commandStdout: 'STDOUT',
-    commandStderr: 'STDERR',
-    commandNoOutput: '(empty)',
-    commandExitCode: 'Exit code',
-    commandSignal: 'Signal',
-    commandSpawnError: 'Failed to start SSH command',
-    commandOutputTruncated: 'Output truncated to {limitKb} KB',
-    copyIdDialogTitle: 'SSH copy-id',
-    copyIdUsePasswordPrompt: 'Use account password for ssh-copy-id?',
-    copyIdRunning: 'Running ssh-copy-id for {host}',
-    copyIdFinished: 'ssh-copy-id for {host} finished (code: {code})',
-    copyIdOutputTitle: 'ssh-copy-id output',
-    copyIdSpawnError: 'Failed to start ssh-copy-id',
-    configExportDialogTitle: 'Export config',
-    configImportDialogTitle: 'Import config',
-    configExportPathPrompt: 'Export file path',
-    configImportPathPrompt: 'Import file path',
-    configImportConfirm: 'Import config from "{path}" and replace current tunnels?',
-    configExported: 'Config exported to {path}',
-    configImported: 'Config imported from {path}',
-    yes: 'yes',
-    no: 'no',
-    btnDelete: 'Delete',
-    btnBack: 'Back',
-    btnNext: 'Next',
-    btnCancel: 'Cancel',
-    btnClose: 'Close',
-    authAgent: 'agent/key',
-    authPassword: 'password',
-    tunnelListFmt:
-      '[{state}] {name} | {type} {spec} | host:{host} | auth:{auth} | pid:{pid}',
-    hostListFmt: '{name}{patternMark}',
-    patternMark: ' [pattern]',
-    stateRunning: 'running',
-    stateStopped: 'stopped',
-    statusPrefix: 'Status: '
-  },
-  ru: {
-    appTitle: 'SSHHelper',
-    hostPanel: 'Hosts из ~/.ssh/config',
-    hostColumns: 'Alias | URL | Порт',
-    tunnelPanel: 'Туннели',
-    statusReady: 'Готово',
-    footerKeys:
-      'Tab смена панели | Enter/C(С) подключиться | A(Ф) добавить выбранное | S(Ы) старт | X(Ч) стоп | D(В) удалить выбранное | E(У) удал.команда | I(Ш) copy-id | O(Щ) экспорт | P(З) импорт | R(К) обновить | L(Д) язык | Q(Й) выход',
-    footerKeysCompact:
-      'Tab панель | Enter/C(С) подключение | A(Ф) добавить выбранное | S(Ы) старт | X(Ч) стоп | D(В) удалить выбранное | E(У) ком | I(Ш) copy-id | O(Щ) эксп | P(З) имп | R(К) обновить | L(Д) язык | Q(Й) выход',
-    noHosts: 'В ~/.ssh/config хосты не найдены',
-    noTunnels: 'Туннелей пока нет. Нажмите A(Ф) для добавления.',
-    connectPromptPattern: 'Выбран шаблон. Введите конкретный hostname',
-    connectPromptManual: 'Введите alias или hostname',
-    addTunnelTitle: 'Создать туннель',
-    addTunnelStep: 'Добавление туннеля - Шаг {step}',
-    addHostStep: 'Добавление хоста - Шаг {step}',
-    hostAliasPrompt: 'Alias хоста',
-    hostNamePrompt: 'HostName',
-    hostUserPrompt: 'User',
-    hostPortPrompt: 'Порт',
-    tunnelNamePrompt: 'Имя туннеля',
-    tunnelTypePrompt: 'Тип туннеля (L/R/D)',
-    tunnelHostPrompt: 'SSH alias или hostname',
-    tunnelLocalPortPrompt: 'Локальный порт',
-    tunnelRemotePortPrompt: 'Удаленный порт',
-    tunnelTargetHostPrompt: 'Целевой хост',
-    tunnelTargetPortPrompt: 'Целевой порт',
-    tunnelAuthPrompt: 'Использовать пароль для туннеля?',
-    tunnelPasswordPrompt: 'Пароль (не сохраняется)',
-    tunnelCreated: 'Туннель сохранен',
-    tunnelStarted: 'Туннель запущен',
-    tunnelStopped: 'Туннель остановлен',
-    tunnelDeleted: 'Туннель удален',
-    hostAdded: 'Хост добавлен в ~/.ssh/config',
-    hostDeleted: 'Хост удален из ~/.ssh/config',
-    tunnelStartFailed: 'Не удалось запустить туннель',
-    tunnelStopFailed: 'Не удалось остановить туннель',
-    invalidInput: 'Неверный ввод',
-    sshExitCode: 'SSH сессия завершилась с кодом {code}',
-    launchingSsh: 'Запуск ssh {host}',
-    reloadDone: 'Список хостов и статусы туннелей обновлены',
-    languageSet: 'Язык переключен на {lang}',
-    confirmDelete: 'Удалить запись туннеля?',
-    deleteDialogTitle: 'Удаление туннеля',
-    confirmDeleteHost: 'Удалить хост "{host}" из ~/.ssh/config?',
-    deleteHostDialogTitle: 'Удаление хоста',
-    runCommandDialogTitle: 'Выполнить удаленную команду',
-    commandPrompt: 'Удаленная команда для выполнения',
-    commandOutputTitle: 'Вывод команды',
-    commandOutputHint: 'Esc/Enter закрыть | Up/Down/PgUp/PgDn прокрутка',
-    commandRunning: 'Выполняется на {host}: {command}',
-    commandFinished: 'Команда на {host} завершена (код: {code})',
-    commandHost: 'Хост',
-    commandStdout: 'STDOUT',
-    commandStderr: 'STDERR',
-    commandNoOutput: '(пусто)',
-    commandExitCode: 'Код выхода',
-    commandSignal: 'Сигнал',
-    commandSpawnError: 'Не удалось запустить SSH-команду',
-    commandOutputTruncated: 'Вывод обрезан до {limitKb} КБ',
-    copyIdDialogTitle: 'SSH copy-id',
-    copyIdUsePasswordPrompt: 'Использовать пароль аккаунта для ssh-copy-id?',
-    copyIdRunning: 'Выполняется ssh-copy-id для {host}',
-    copyIdFinished: 'ssh-copy-id для {host} завершен (код: {code})',
-    copyIdOutputTitle: 'Вывод ssh-copy-id',
-    copyIdSpawnError: 'Не удалось запустить ssh-copy-id',
-    configExportDialogTitle: 'Экспорт конфига',
-    configImportDialogTitle: 'Импорт конфига',
-    configExportPathPrompt: 'Путь файла экспорта',
-    configImportPathPrompt: 'Путь файла импорта',
-    configImportConfirm: 'Импортировать конфиг из "{path}" и заменить текущие туннели?',
-    configExported: 'Конфиг экспортирован в {path}',
-    configImported: 'Конфиг импортирован из {path}',
-    yes: 'да',
-    no: 'нет',
-    btnDelete: 'Удалить',
-    btnBack: 'Назад',
-    btnNext: 'Далее',
-    btnCancel: 'Отмена',
-    btnClose: 'Закрыть',
-    authAgent: 'agent/key',
-    authPassword: 'password',
-    tunnelListFmt:
-      '[{state}] {name} | {type} {spec} | host:{host} | auth:{auth} | pid:{pid}',
-    hostListFmt: '{name}{patternMark}',
-    patternMark: ' [шаблон]',
-    stateRunning: 'running',
-    stateStopped: 'stopped',
-    statusPrefix: 'Статус: '
+const fs = require('fs');
+const path = require('path');
+
+const LOCALES_DIR = path.join(__dirname, 'locales');
+const DEFAULT_LOCALE = 'en';
+
+function loadTranslations() {
+  const result = {};
+  if (!fs.existsSync(LOCALES_DIR)) {
+    return result;
   }
-};
+
+  const files = fs.readdirSync(LOCALES_DIR, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith('.json'))
+    .map((entry) => entry.name);
+
+  for (const fileName of files) {
+    const locale = path.basename(fileName, '.json').trim();
+    if (!locale) {
+      continue;
+    }
+    const filePath = path.join(LOCALES_DIR, fileName);
+    try {
+      const raw = fs.readFileSync(filePath, 'utf8');
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') {
+        result[locale] = parsed;
+      }
+    } catch (error) {
+      // Ignore malformed locale files so one bad file does not break the app.
+    }
+  }
+
+  return result;
+}
+
+const TRANSLATIONS = loadTranslations();
 
 function getByPath(dict, key) {
-  return key.split('.').reduce((acc, part) => (acc && acc[part] ? acc[part] : null), dict);
+  return String(key || '')
+    .split('.')
+    .reduce((acc, part) => (acc && acc[part] != null ? acc[part] : null), dict);
 }
 
 function format(str, vars) {
@@ -198,30 +53,55 @@ function format(str, vars) {
   });
 }
 
+function getAvailableLocales() {
+  const locales = Object.keys(TRANSLATIONS);
+  if (!locales.length) {
+    return [DEFAULT_LOCALE];
+  }
+  if (!locales.includes(DEFAULT_LOCALE)) {
+    return locales;
+  }
+  return [DEFAULT_LOCALE, ...locales.filter((code) => code !== DEFAULT_LOCALE)];
+}
+
+function getFallbackLocale() {
+  const locales = getAvailableLocales();
+  if (locales.includes(DEFAULT_LOCALE)) {
+    return DEFAULT_LOCALE;
+  }
+  return locales[0];
+}
+
+function getLocaleMeta(locale) {
+  const code = String(locale || '');
+  const dict = TRANSLATIONS[code];
+  const meta = dict && typeof dict.__meta === 'object' ? dict.__meta : {};
+  return {
+    code,
+    name: typeof meta.name === 'string' && meta.name.trim() ? meta.name.trim() : code,
+    nativeName: typeof meta.nativeName === 'string' && meta.nativeName.trim() ? meta.nativeName.trim() : code
+  };
+}
+
 function createI18n(locale) {
-  const selected = TRANSLATIONS[locale] ? locale : 'en';
+  const fallback = getFallbackLocale();
+  const selected = TRANSLATIONS[locale] ? locale : fallback;
   return {
     locale: selected,
     t(key, vars = {}) {
-      const value = getByPath(TRANSLATIONS[selected], key) || getByPath(TRANSLATIONS.en, key) || key;
+      const value = getByPath(TRANSLATIONS[selected], key)
+        || getByPath(TRANSLATIONS[fallback], key)
+        || key;
       if (typeof value !== 'string') {
-        return key;
+        return String(key);
       }
       return format(value, vars);
     }
   };
 }
 
-function nextLocale(locale) {
-  const locales = Object.keys(TRANSLATIONS);
-  const idx = locales.indexOf(locale);
-  if (idx === -1) {
-    return locales[0];
-  }
-  return locales[(idx + 1) % locales.length];
-}
-
 module.exports = {
   createI18n,
-  nextLocale
+  getAvailableLocales,
+  getLocaleMeta
 };
