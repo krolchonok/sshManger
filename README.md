@@ -22,11 +22,53 @@ Terminal UI SSH manager on Node.js.
 npm install
 ```
 
+## Global CLI Install
+
+```bash
+# local source (from this folder)
+npm i -g .
+
+# from npm registry (after publish)
+npm i -g @ushastoe/sshhelper
+```
+
+Command name: `sshhelper`
+
 ## Run
 
 ```bash
 npm start
 ```
+
+## Build Binaries
+
+```bash
+# Windows .exe
+npm run build:win
+
+# Linux executable
+npm run build:linux
+
+# Both
+npm run build:all
+```
+
+Build artifacts are written to `dist/`.
+
+## Publish to npm
+
+```bash
+# 1) login once
+npm login
+
+# 2) check package contents/version
+npm pack --dry-run
+
+# 3) publish
+npm publish
+```
+
+Package name is configured as `@ushastoe/sshhelper` (scoped public package).
 
 ## Keybindings
 

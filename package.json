@@ -1,19 +1,45 @@
 {
-  "name": "sshhelper",
+  "name": "@ushastoe/sshhelper",
   "version": "1.0.0",
   "description": "SSHHelper TUI SSH manager",
   "main": "src/index.js",
+  "bin": {
+    "sshhelper": "src/index.js"
+  },
+  "files": [
+    "src/**/*",
+    "README.md"
+  ],
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "node src/index.js",
-    "lint": "node -e \"console.log(\\\"No lint configured\\\")\""
+    "lint": "node -e \"console.log(\\\"No lint configured\\\")\"",
+    "build:win": "pkg . --targets node18-win-x64 --output dist/sshhelper-win.exe",
+    "build:linux": "pkg . --targets node18-linux-x64 --output dist/sshhelper-linux",
+    "build:all": "npm run build:win && npm run build:linux",
+    "prepublishOnly": "npm run lint"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "dependencies": {
     "blessed": "^0.1.81",
     "glob": "^13.0.6"
+  },
+  "devDependencies": {
+    "pkg": "^5.8.1"
+  },
+  "pkg": {
+    "assets": [
+      "src/locales/*.json",
+      "node_modules/blessed/usr/**/*"
+    ]
   }
 }
