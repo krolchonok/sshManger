@@ -295,7 +295,7 @@ function showScrollableOutput(screen, text, labels = {}) {
   return new Promise((resolve) => {
     const dialogLabel = labels.dialogLabel || 'Output';
     const hintText = labels.hintText || 'Esc/Enter close | Up/Down/PgUp/PgDn scroll';
-    const closeOnF1 = Boolean(labels.closeOnF1);
+    const closeOnHelpShortcut = Boolean(labels.closeOnHelpShortcut);
     const content = String(text || '');
 
     const box = blessed.box({
@@ -369,7 +369,7 @@ function showScrollableOutput(screen, text, labels = {}) {
       }
 
       const keyName = key ? key.name : '';
-      if (closeOnF1 && keyName === 'f1') {
+      if (closeOnHelpShortcut && ch === '?') {
         close();
         return;
       }
@@ -1392,7 +1392,7 @@ async function runTui({ state, hosts, saveState }) {
         return await showScrollableOutput(screen, text, {
           dialogLabel: options.dialogLabel || i18n.t('commandOutputTitle'),
           hintText: options.hintText || i18n.t('commandOutputHint'),
-          closeOnF1: Boolean(options.closeOnF1)
+          closeOnHelpShortcut: Boolean(options.closeOnHelpShortcut)
         });
       } finally {
         endModal();
@@ -3009,7 +3009,7 @@ async function runTui({ state, hosts, saveState }) {
       await showOutputModal(i18n.t('shortcutsHelpBody'), {
         dialogLabel: i18n.t('shortcutsHelpTitle'),
         hintText: i18n.t('shortcutsHelpHint'),
-        closeOnF1: true
+        closeOnHelpShortcut: true
       });
     }
 
@@ -3950,7 +3950,7 @@ async function runTui({ state, hosts, saveState }) {
       }
       safeUiAction(runPingAllHostsFlow);
     });
-    screen.key(['f1', '?'], () => {
+    screen.key(['?'], () => {
       if (modalDepth > 0) {
         return;
       }
