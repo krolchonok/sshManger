@@ -1,5 +1,6 @@
 'use strict';
 
+const fs = require('fs');
 const path = require('path');
 const blessed = require('blessed');
 const { createI18n, getAvailableLocales, getLocaleMeta } = require('./i18n');
@@ -11,6 +12,9 @@ const {
   runSshCommand,
   runSshCopyId,
   probeSshKeyAuth,
+  runPingCheck,
+  runLocalCommand,
+  commandExists,
   appendTunnelLog
 } = require('./ssh');
 const { loadHostsFromConfig, addHostToConfig, deleteHostFromConfig } = require('./sshConfig');
@@ -28,6 +32,7 @@ const BUTTON_FG = 'black';
 const BUTTON_FG_ACTIVE = 'black';
 const DIALOG_BACK = '__dialog_back__';
 const COMMAND_OUTPUT_LIMIT_BYTES = 200 * 1024;
+const PICKER_DEBUG_LOG = path.join(STATE_DIR, 'picker-debug.log');
 
 function normalizeAccentColor(color) {
   const normalized = String(color || '').trim().toLowerCase();
@@ -60,6 +65,19 @@ function showTerminalCursor(screen) {
 
 function generateId() {
   return `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+}
+
+function shellQuote(value) {
+  return `'${String(value || '').replace(/'/g, `'\"'\"'`)}'`;
+}
+
+function appendPickerDebug(message) {
+  try {
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+    fs.appendFileSync(PICKER_DEBUG_LOG, `[${new Date().toISOString()}] ${String(message || '').trim()}\n`, 'utf8');
+  } catch (error) {
+    // ignore debug log errors
+  }
 }
 
 function resolveUserPath(inputPath) {
@@ -1308,6 +1326,9 @@ async function runTui({ state, hosts, saveState }) {
 
     let focusLeft = true;
     let hostRows = [];
+    let selectedLocalPathSelection = '';
+    let selectedRemotePathSelection = null;
+    let selectedRemoteUploadDirSelection = null;
     let closing = false;
     let modalDepth = 0;
 
@@ -1556,6 +1577,30 @@ async function runTui({ state, hosts, saveState }) {
         lines.push('', i18n.t('commandOutputTruncated', { limitKb: outputLimitKb }));
       }
 
+      return lines.join('\n');
+    }
+
+    function buildTransferReport(tool, args, result) {
+      const stdoutText = result.stdout && result.stdout.length > 0 ? result.stdout : i18n.t('commandNoOutput');
+      const stderrText = result.stderr && result.stderr.length > 0 ? result.stderr : i18n.t('commandNoOutput');
+      const codeText = result.code === null ? 'null' : String(result.code);
+      const lines = [
+        `$ ${tool} ${args.join(' ')}`,
+        '',
+        `${i18n.t('commandStdout')}:`,
+        stdoutText,
+        '',
+        `${i18n.t('commandStderr')}:`,
+        stderrText,
+        '',
+        `${i18n.t('commandExitCode')}: ${codeText}`
+      ];
+      if (result.signal) {
+        lines.push(`${i18n.t('commandSignal')}: ${result.signal}`);
+      }
+      if (result.error) {
+        lines.push(`${i18n.t('commandSpawnError')}: ${result.error}`);
+      }
       return lines.join('\n');
     }
 
@@ -2968,6 +3013,753 @@ async function runTui({ state, hosts, saveState }) {
       });
     }
 
+    function firstLine(text) {
+      const raw = String(text || '').trim();
+      if (!raw) {
+        return '';
+      }
+      return raw.split(/\r?\n/)[0].trim();
+    }
+
+    function sortEntries(entries) {
+      return entries
+        .slice()
+        .sort((a, b) => {
+          const rankA = a.type === 'dir' ? 0 : 1;
+          const rankB = b.type === 'dir' ? 0 : 1;
+          if (rankA !== rankB) {
+            return rankA - rankB;
+          }
+          return a.name.localeCompare(b.name);
+        });
+    }
+
+    function listLocalDirectory(dirPath) {
+      const absolutePath = path.resolve(String(dirPath || HOME_DIR));
+      const items = fs.readdirSync(absolutePath, { withFileTypes: true })
+        .map((entry) => ({
+          name: entry.name,
+          type: entry.isDirectory() ? 'dir' : 'file',
+          path: path.join(absolutePath, entry.name)
+        }));
+      const entries = sortEntries(items);
+      const parentPath = path.dirname(absolutePath);
+      if (parentPath !== absolutePath) {
+        entries.unshift({
+          name: '..',
+          type: 'up',
+          path: parentPath
+        });
+      }
+      return {
+        path: absolutePath,
+        entries
+      };
+    }
+
+    async function listRemoteDirectory(host, dirPath, password) {
+      const rawPath = String(dirPath || '.').trim();
+      const remotePath = (!rawPath || rawPath === '~') ? '.' : rawPath;
+      appendPickerDebug(`listRemoteDirectory host=${host} requestPath=${remotePath}`);
+      const script = [
+        `d=${shellQuote(remotePath)}`,
+        'cd "$d" 2>/dev/null || exit 2',
+        'p="$(pwd -P 2>/dev/null || pwd)"',
+        'printf "__PWD__\\t%s\\n" "$p"',
+        'LC_ALL=C ls -A1p'
+      ].join('; ');
+      const command = `sh -lc ${shellQuote(script)}`;
+      const result = await runSshCommand(host, command, {
+        outputLimitBytes: 128 * 1024,
+        password
+      });
+      appendPickerDebug(
+        `listRemoteDirectory result host=${host} code=${result.code} error=${result.error || '-'} stdout1=${firstLine(result.stdout)} stderr1=${firstLine(result.stderr)}`
+      );
+      if (result.error) {
+        appendPickerDebug(`listRemoteDirectory throw host=${host} reason=${result.error}`);
+        throw new Error(result.error);
+      }
+      if (result.code !== 0) {
+        const reason = firstLine(result.stderr)
+          || firstLine(result.stdout)
+          || `Remote list command failed (code ${result.code})`;
+        appendPickerDebug(`listRemoteDirectory throw host=${host} reason=${reason}`);
+        throw new Error(reason);
+      }
+
+      const lines = String(result.stdout || '').split(/\r?\n/).filter(Boolean);
+      const pwdLine = lines.find((line) => line.startsWith('__PWD__\t'));
+      if (!pwdLine) {
+        const reason = firstLine(result.stderr) || 'Remote directory listing failed';
+        appendPickerDebug(`listRemoteDirectory throw host=${host} reason=${reason} stdout=${result.stdout || ''}`);
+        throw new Error(reason);
+      }
+      const currentPath = pwdLine.slice('__PWD__\t'.length);
+      appendPickerDebug(`listRemoteDirectory raw currentPath="${currentPath}" host=${host}`);
+      const parsed = [];
+      for (const line of lines) {
+        if (line.startsWith('__PWD__\t')) {
+          continue;
+        }
+        const rawName = line.trim();
+        if (!rawName || rawName === '.' || rawName === '..') {
+          continue;
+        }
+        const isDir = rawName.endsWith('/');
+        const name = isDir ? rawName.slice(0, -1) : rawName;
+        if (!name) {
+          continue;
+        }
+        const fullPath = path.posix.join(currentPath, name).replace(/\/{2,}/g, '/');
+        parsed.push({
+          name,
+          type: isDir ? 'dir' : 'file',
+          path: fullPath
+        });
+      }
+
+      const entries = sortEntries(parsed);
+      appendPickerDebug(`listRemoteDirectory parsed host=${host} currentPath=${currentPath} entries=${entries.length}`);
+      const parentPath = path.posix.dirname(currentPath);
+      if (parentPath !== currentPath) {
+        entries.unshift({
+          name: '..',
+          type: 'up',
+          path: parentPath
+        });
+      }
+
+      return {
+        path: currentPath,
+        entries
+      };
+    }
+
+    async function showFilePickerModal(config) {
+      beginModal();
+      try {
+        return await new Promise((resolve) => {
+          const box = blessed.box({
+            parent: screen,
+            border: 'line',
+            label: ` ${config.title} `,
+            width: '80%',
+            height: '75%',
+            top: 'center',
+            left: 'center',
+            keys: true,
+            mouse: true,
+            style: {
+              border: { fg: primaryColor, bg: DIALOG_BG },
+              bg: DIALOG_BG,
+              fg: DIALOG_FG
+            }
+          });
+
+          const pathText = blessed.text({
+            parent: box,
+            top: 1,
+            left: 2,
+            right: 2,
+            height: 1,
+            content: '',
+            style: {
+              bg: DIALOG_BG,
+              fg: DIALOG_FG
+            }
+          });
+
+          const list = blessed.list({
+            parent: box,
+            border: 'line',
+            top: 3,
+            left: 2,
+            right: 2,
+            bottom: 4,
+            keys: false,
+            vi: false,
+            mouse: true,
+            items: [],
+            style: {
+              selected: { bg: primaryColor, fg: 'black' },
+              border: { fg: 'white', bg: DIALOG_BG },
+              bg: DIALOG_BG,
+              fg: DIALOG_FG
+            }
+          });
+
+          blessed.text({
+            parent: box,
+            left: 2,
+            right: 2,
+            bottom: 1,
+            height: 2,
+            wrap: true,
+            content: config.hint,
+            style: {
+              bg: DIALOG_BG,
+              fg: DIALOG_FG
+            }
+          });
+
+          let done = false;
+          let entries = [];
+          let currentPath = config.startPath;
+          let loading = false;
+
+          function finish(value) {
+            if (done) {
+              return;
+            }
+            done = true;
+            box.destroy();
+            screen.render();
+            resolve(value);
+          }
+
+          function renderList() {
+            const items = entries.length
+              ? entries.map((entry) => (entry.type === 'dir' || entry.type === 'up' ? `[D] ${entry.name}` : `[F] ${entry.name}`))
+              : [i18n.t('filePickerNoItems')];
+            list.setItems(items);
+            list.select(0);
+            screen.render();
+          }
+
+          async function loadPath(nextPath) {
+            if (loading) {
+              return;
+            }
+            loading = true;
+            setStatus(i18n.t('filePickerLoading', { path: nextPath }));
+            try {
+              const result = await config.loadDirectory(nextPath);
+              currentPath = result.path;
+              entries = Array.isArray(result.entries) ? result.entries : [];
+              pathText.setContent(currentPath);
+              renderList();
+            } catch (error) {
+              setStatus(i18n.t('filePickerLoadFailed', { error: error.message }));
+            } finally {
+              loading = false;
+            }
+          }
+
+          function selectedEntry() {
+            if (!entries.length) {
+              return null;
+            }
+            const idx = Number.isInteger(list.selected) ? list.selected : 0;
+            return entries[Math.max(0, Math.min(entries.length - 1, idx))];
+          }
+
+          function moveSelection(delta) {
+            if (!entries.length) {
+              return;
+            }
+            const idx = Number.isInteger(list.selected) ? list.selected : 0;
+            const next = (idx + delta + entries.length) % entries.length;
+            list.select(next);
+            screen.render();
+          }
+
+          async function openSelected() {
+            const entry = selectedEntry();
+            if (!entry) {
+              return;
+            }
+            if (entry.type === 'dir' || entry.type === 'up') {
+              await loadPath(entry.path);
+              return;
+            }
+            finish(entry.path);
+          }
+
+          async function goParent() {
+            const parent = entries.find((item) => item.type === 'up');
+            if (parent) {
+              await loadPath(parent.path);
+            }
+          }
+
+          async function handleKey(ch, key) {
+            if (done) {
+              return;
+            }
+            if (key && key.full === 'C-c') {
+              return;
+            }
+            if (key && key.name === 'escape') {
+              finish(null);
+              return;
+            }
+            if (key && key.name === 'tab') {
+              finish(null);
+              return;
+            }
+            const isBack = (key && (key.name === 'backspace' || key.name === 'delete' || key.full === 'backspace'))
+              || ch === '\b'
+              || ch === '\x7f';
+            if (isBack) {
+              await goParent();
+              return;
+            }
+            if (key && (key.name === 'up' || key.name === 'k')) {
+              moveSelection(-1);
+              return;
+            }
+            if (key && (key.name === 'down' || key.name === 'j')) {
+              moveSelection(1);
+              return;
+            }
+            if (key && key.name === 'enter') {
+              await openSelected();
+              return;
+            }
+            const isSpace = (key && (key.name === 'space' || key.full === 'space')) || ch === ' ';
+            if (config.allowDirectorySelection && isSpace) {
+              const entry = selectedEntry();
+              if (entry && (entry.type === 'dir' || entry.type === 'up')) {
+                finish(entry.path);
+                return;
+              }
+              finish(currentPath);
+            }
+          }
+
+          box.on('keypress', (ch, key) => {
+            Promise.resolve(handleKey(ch, key)).catch((error) => {
+              setStatus(error && error.message ? error.message : 'Unexpected error');
+            });
+          });
+          list.on('click', () => {
+            box.focus();
+            screen.render();
+          });
+
+          box.focus();
+          Promise.resolve(loadPath(config.startPath)).catch((error) => {
+            setStatus(error && error.message ? error.message : 'Unexpected error');
+          });
+        });
+      } finally {
+        endModal();
+      }
+    }
+
+    async function runKeyAuditAllHostsFlow() {
+      const candidates = hostRows.filter((host) => host && !host.isPattern && host.name);
+      if (!candidates.length) {
+        setStatus(i18n.t('keyAuditNoHosts'));
+        return;
+      }
+
+      const timeoutMs = 5000;
+      const connectTimeoutSec = 4;
+      const lines = [];
+      let ok = 0;
+      let rejected = 0;
+      let errors = 0;
+
+      setStatus(i18n.t('keyAuditStarted', { count: candidates.length }));
+      lines.push(`${i18n.t('keyAuditStarted', { count: candidates.length })}`);
+      lines.push(`timeout: ${timeoutMs}ms per host`);
+      lines.push('');
+
+      for (let idx = 0; idx < candidates.length; idx += 1) {
+        const host = candidates[idx];
+        setStatus(i18n.t('keyAuditProgress', { index: idx + 1, total: candidates.length, host: host.name }));
+        const result = await probeSshKeyAuth(host.name, { timeoutMs, connectTimeoutSec });
+        if (result.ok) {
+          ok += 1;
+          lines.push(`[OK] ${host.name}`);
+          continue;
+        }
+
+        const details = firstLine(result.stderr) || firstLine(result.stdout) || firstLine(result.error);
+        if (result.authFailed) {
+          rejected += 1;
+          lines.push(`[REJECTED] ${host.name}${details ? ` - ${details}` : ''}`);
+          continue;
+        }
+
+        errors += 1;
+        lines.push(`[ERROR] ${host.name}${details ? ` - ${details}` : ''}`);
+      }
+
+      setStatus(i18n.t('keyAuditDone', { ok, rejected, errors }));
+      lines.push('');
+      lines.push(i18n.t('keyAuditDone', { ok, rejected, errors }));
+      await showOutputModal(lines.join('\n'), {
+        dialogLabel: i18n.t('keyAuditTitle'),
+        hintText: i18n.t('keyAuditHint')
+      });
+    }
+
+    async function runPingAllHostsFlow() {
+      const candidates = hostRows.filter((host) => host && !host.isPattern && host.name);
+      if (!candidates.length) {
+        setStatus(i18n.t('pingAuditNoHosts'));
+        return;
+      }
+
+      const timeoutMs = 3000;
+      const lines = [];
+      let ok = 0;
+      let failed = 0;
+
+      setStatus(i18n.t('pingAuditStarted', { count: candidates.length }));
+      lines.push(`${i18n.t('pingAuditStarted', { count: candidates.length })}`);
+      lines.push(`timeout: ${timeoutMs}ms per host`);
+      lines.push('');
+
+      for (let idx = 0; idx < candidates.length; idx += 1) {
+        const host = candidates[idx];
+        setStatus(i18n.t('pingAuditProgress', { index: idx + 1, total: candidates.length, host: host.name }));
+        const result = await runPingCheck(host.name, { timeoutMs });
+        if (result.ok) {
+          ok += 1;
+          lines.push(`[OK] ${host.name}`);
+          continue;
+        }
+        failed += 1;
+        const details = firstLine(result.output) || firstLine(result.error);
+        lines.push(`[FAIL] ${host.name}${details ? ` - ${details}` : ''}`);
+      }
+
+      setStatus(i18n.t('pingAuditDone', { ok, failed }));
+      lines.push('');
+      lines.push(i18n.t('pingAuditDone', { ok, failed }));
+      await showOutputModal(lines.join('\n'), {
+        dialogLabel: i18n.t('pingAuditTitle'),
+        hintText: i18n.t('pingAuditHint')
+      });
+    }
+
+    async function openLocalFilePickerFlow() {
+      const selectedPath = await showFilePickerModal({
+        title: i18n.t('filePickerLocalPathTitle'),
+        hint: i18n.t('filePickerHintDir'),
+        startPath: HOME_DIR,
+        allowDirectorySelection: true,
+        loadDirectory: async (dirPath) => listLocalDirectory(dirPath)
+      });
+      if (!selectedPath) {
+        return null;
+      }
+      selectedLocalPathSelection = selectedPath;
+      setStatus(i18n.t('filePickerSelectedLocal', { path: selectedPath }));
+      return selectedPath;
+    }
+
+    async function pickRemoteFileForTarget(target) {
+      if (!target || !target.host) {
+        setStatus(i18n.t('filePickerNoTargetHost'));
+        return null;
+      }
+
+      let password = '';
+      if (target.usePassword) {
+        const entered = await askSecretModal(i18n.t('tunnelPasswordPrompt'), {
+          dialogLabel: i18n.t('filePickerRemoteTitle')
+        });
+        if (!entered) {
+          return;
+        }
+        password = entered;
+      }
+
+      const selectedPath = await showFilePickerModal({
+        title: `${i18n.t('filePickerRemoteTitle')} (${target.host})`,
+        hint: i18n.t('filePickerHint'),
+        startPath: '.',
+        loadDirectory: async (dirPath) => listRemoteDirectory(target.host, dirPath, password)
+      });
+      if (!selectedPath) {
+        return null;
+      }
+      selectedRemotePathSelection = { host: target.host, path: selectedPath };
+      setStatus(i18n.t('filePickerSelectedRemote', { path: selectedPath }));
+      return selectedPath;
+    }
+
+    async function pickLocalPathForTransfer() {
+      const selectedPath = await showFilePickerModal({
+        title: i18n.t('filePickerLocalPathTitle'),
+        hint: i18n.t('filePickerHintDir'),
+        startPath: HOME_DIR,
+        allowDirectorySelection: true,
+        loadDirectory: async (dirPath) => listLocalDirectory(dirPath)
+      });
+      if (!selectedPath) {
+        return null;
+      }
+      selectedLocalPathSelection = selectedPath;
+      setStatus(i18n.t('filePickerSelectedLocal', { path: selectedPath }));
+      return selectedPath;
+    }
+
+    async function pickLocalDestinationDirectory() {
+      while (true) {
+        const startPath = selectedLocalPathSelection && fs.existsSync(selectedLocalPathSelection)
+          ? (fs.statSync(selectedLocalPathSelection).isDirectory()
+            ? selectedLocalPathSelection
+            : path.dirname(selectedLocalPathSelection))
+          : HOME_DIR;
+        const selectedPath = await showFilePickerModal({
+          title: i18n.t('filePickerLocalDestTitle'),
+          hint: i18n.t('filePickerHintDir'),
+          startPath,
+          allowDirectorySelection: true,
+          loadDirectory: async (dirPath) => listLocalDirectory(dirPath)
+        });
+        if (!selectedPath) {
+          return null;
+        }
+        if (fs.existsSync(selectedPath) && fs.statSync(selectedPath).isDirectory()) {
+          selectedLocalPathSelection = selectedPath;
+          setStatus(i18n.t('filePickerSelectedLocal', { path: selectedPath }));
+          return selectedPath;
+        }
+        setStatus(i18n.t('transferNeedLocalDirectory'));
+      }
+    }
+
+    async function pickRemoteDirectoryForTarget(target) {
+      if (!target || !target.host) {
+        setStatus(i18n.t('filePickerNoTargetHost'));
+        return null;
+      }
+
+      let password = '';
+      if (target.usePassword) {
+        const entered = await askSecretModal(i18n.t('tunnelPasswordPrompt'), {
+          dialogLabel: i18n.t('filePickerRemoteDirTitle')
+        });
+        if (!entered) {
+          return null;
+        }
+        password = entered;
+      }
+
+      const selectedPath = await showFilePickerModal({
+        title: `${i18n.t('filePickerRemoteDirTitle')} (${target.host})`,
+        hint: i18n.t('filePickerHintDir'),
+        startPath: '.',
+        allowDirectorySelection: true,
+        loadDirectory: async (dirPath) => listRemoteDirectory(target.host, dirPath, password)
+      });
+      if (!selectedPath) {
+        return null;
+      }
+      selectedRemoteUploadDirSelection = { host: target.host, path: selectedPath };
+      setStatus(i18n.t('filePickerSelectedRemote', { path: selectedPath }));
+      return selectedPath;
+    }
+
+    async function pickRemotePathForTransfer(target) {
+      if (!target || !target.host) {
+        setStatus(i18n.t('filePickerNoTargetHost'));
+        return null;
+      }
+
+      let password = '';
+      if (target.usePassword) {
+        const entered = await askSecretModal(i18n.t('tunnelPasswordPrompt'), {
+          dialogLabel: i18n.t('filePickerRemotePathTitle')
+        });
+        if (!entered) {
+          return null;
+        }
+        password = entered;
+      }
+
+      const selectedPath = await showFilePickerModal({
+        title: `${i18n.t('filePickerRemotePathTitle')} (${target.host})`,
+        hint: i18n.t('filePickerHintDir'),
+        startPath: '.',
+        allowDirectorySelection: true,
+        loadDirectory: async (dirPath) => listRemoteDirectory(target.host, dirPath, password)
+      });
+      if (!selectedPath) {
+        return null;
+      }
+      selectedRemotePathSelection = { host: target.host, path: selectedPath };
+      setStatus(i18n.t('filePickerSelectedRemote', { path: selectedPath }));
+      return selectedPath;
+    }
+
+    async function openRemoteFilePickerFlow() {
+      const target = await resolveCommandTarget();
+      await pickRemotePathForTransfer(target);
+    }
+
+    async function askTransferMethod() {
+      while (true) {
+        const raw = await askTextModal(i18n.t('transferMethodPrompt'), 'scp', {
+          dialogLabel: i18n.t('transferDialogTitle')
+        });
+        if (!raw) {
+          return null;
+        }
+        const method = String(raw).trim().toLowerCase();
+        if (method === 'scp' || method === 'rsync') {
+          return method;
+        }
+        setStatus(i18n.t('transferInvalidMethod'));
+      }
+    }
+
+    async function ensureRemotePathExists(host, remotePath, password) {
+      const command = `sh -lc "test -e ${shellQuote(remotePath)}"`;
+      const result = await runSshCommand(host, command, {
+        outputLimitBytes: 8 * 1024,
+        password
+      });
+      return result.code === 0;
+    }
+
+    async function ensureRemoteDirectoryExists(host, remotePath, password) {
+      const command = `sh -lc "test -d ${shellQuote(remotePath)}"`;
+      const result = await runSshCommand(host, command, {
+        outputLimitBytes: 8 * 1024,
+        password
+      });
+      return result.code === 0;
+    }
+
+    async function runTransferUploadFlow() {
+      const target = await resolveCommandTarget();
+      if (!target || !target.host) {
+        setStatus(i18n.t('filePickerNoTargetHost'));
+        return;
+      }
+      if (target.usePassword) {
+        setStatus(i18n.t('transferPasswordUnsupported'));
+        return;
+      }
+
+      const method = await askTransferMethod();
+      if (!method) {
+        return;
+      }
+      if (!(await commandExists(method))) {
+        setStatus(i18n.t('transferToolMissing', { tool: method }));
+        return;
+      }
+
+      let localPath = selectedLocalPathSelection;
+      if (!localPath) {
+        localPath = await pickLocalPathForTransfer();
+      }
+      if (!localPath) {
+        setStatus(i18n.t('transferNeedLocalFile'));
+        return;
+      }
+      if (!fs.existsSync(localPath)) {
+        setStatus(i18n.t('transferPathNotFoundLocal', { path: localPath }));
+        return;
+      }
+
+      let remotePath = selectedRemoteUploadDirSelection
+        && selectedRemoteUploadDirSelection.host === target.host
+        ? selectedRemoteUploadDirSelection.path
+        : '';
+      if (!remotePath) {
+        remotePath = await pickRemoteDirectoryForTarget(target);
+      }
+      if (!remotePath) {
+        setStatus(i18n.t('transferNeedRemoteFile'));
+        return;
+      }
+      if (!(await ensureRemoteDirectoryExists(target.host, remotePath, ''))) {
+        setStatus(i18n.t('transferPathNotFoundRemote', { path: remotePath }));
+        return;
+      }
+
+      setStatus(i18n.t('transferRunningUpload', { tool: method, src: localPath, host: target.host, dst: remotePath }));
+      const localIsDirectory = fs.statSync(localPath).isDirectory();
+      const args = method === 'rsync'
+        ? ['-av', localPath, `${target.host}:${remotePath}`]
+        : (localIsDirectory ? ['-r', localPath, `${target.host}:${remotePath}`] : [localPath, `${target.host}:${remotePath}`]);
+      const result = await runLocalCommand(method, args, {
+        outputLimitBytes: COMMAND_OUTPUT_LIMIT_BYTES,
+        timeoutMs: 120_000
+      });
+      await showOutputModal(buildTransferReport(method, args, result), {
+        dialogLabel: i18n.t('transferOutputTitle'),
+        hintText: i18n.t('commandOutputHint')
+      });
+      const statusCode = result.code === null ? (result.signal ? `signal:${result.signal}` : 'null') : String(result.code);
+      setStatus(i18n.t('transferDone', { code: statusCode }));
+    }
+
+    async function runTransferDownloadFlow() {
+      const target = await resolveCommandTarget();
+      if (!target || !target.host) {
+        setStatus(i18n.t('filePickerNoTargetHost'));
+        return;
+      }
+      if (target.usePassword) {
+        setStatus(i18n.t('transferPasswordUnsupported'));
+        return;
+      }
+
+      const method = await askTransferMethod();
+      if (!method) {
+        return;
+      }
+      if (!(await commandExists(method))) {
+        setStatus(i18n.t('transferToolMissing', { tool: method }));
+        return;
+      }
+
+      let remotePath = selectedRemotePathSelection
+        && selectedRemotePathSelection.host === target.host
+        ? selectedRemotePathSelection.path
+        : '';
+      if (!remotePath) {
+        remotePath = await pickRemotePathForTransfer(target);
+      }
+      if (!remotePath) {
+        setStatus(i18n.t('transferNeedRemoteFile'));
+        return;
+      }
+
+      if (!(await ensureRemotePathExists(target.host, remotePath, ''))) {
+        setStatus(i18n.t('transferPathNotFoundRemote', { path: remotePath }));
+        return;
+      }
+
+      const localPath = await pickLocalDestinationDirectory();
+      if (!localPath) {
+        setStatus(i18n.t('transferNeedLocalDirectory'));
+        return;
+      }
+
+      if (!fs.existsSync(localPath)) {
+        setStatus(i18n.t('transferPathNotFoundLocal', { path: localPath }));
+        return;
+      }
+
+      setStatus(i18n.t('transferRunningDownload', { tool: method, host: target.host, src: remotePath, dst: localPath }));
+      const remoteIsDirectory = await ensureRemoteDirectoryExists(target.host, remotePath, '');
+      const args = method === 'rsync'
+        ? ['-av', `${target.host}:${remotePath}`, localPath]
+        : (remoteIsDirectory ? ['-r', `${target.host}:${remotePath}`, localPath] : [`${target.host}:${remotePath}`, localPath]);
+      const result = await runLocalCommand(method, args, {
+        outputLimitBytes: COMMAND_OUTPUT_LIMIT_BYTES,
+        timeoutMs: 120_000
+      });
+      await showOutputModal(buildTransferReport(method, args, result), {
+        dialogLabel: i18n.t('transferOutputTitle'),
+        hintText: i18n.t('commandOutputHint')
+      });
+      const statusCode = result.code === null ? (result.signal ? `signal:${result.signal}` : 'null') : String(result.code);
+      setStatus(i18n.t('transferDone', { code: statusCode }));
+    }
+
     async function toggleSelectedTunnelState() {
       const tunnel = selectedTunnel();
       if (!tunnel) {
@@ -3032,6 +3824,9 @@ async function runTui({ state, hosts, saveState }) {
     }
 
     screen.key(['q', 'й', 'Q', 'Й', 'C-c'], () => {
+      if (modalDepth > 0) {
+        return;
+      }
       finalize({ type: 'quit' });
     });
 
@@ -3040,37 +3835,154 @@ async function runTui({ state, hosts, saveState }) {
       screen.render();
     });
 
-    screen.key(['tab'], () => switchFocus());
-    screen.key(['up', 'k'], () => moveFocusedSelection(-1));
-    screen.key(['down', 'j'], () => moveFocusedSelection(1));
+    screen.key(['tab'], () => {
+      if (modalDepth > 0) {
+        return;
+      }
+      switchFocus();
+    });
+    hostList.key(['up', 'k'], () => {
+      if (modalDepth > 0) {
+        return;
+      }
+      focusLeft = true;
+      moveFocusedSelection(-1);
+      applyFocusStyles();
+      screen.render();
+    });
+    hostList.key(['down', 'j'], () => {
+      if (modalDepth > 0) {
+        return;
+      }
+      focusLeft = true;
+      moveFocusedSelection(1);
+      applyFocusStyles();
+      screen.render();
+    });
+    tunnelList.key(['up', 'k'], () => {
+      if (modalDepth > 0) {
+        return;
+      }
+      focusLeft = false;
+      moveFocusedSelection(-1);
+      applyFocusStyles();
+      screen.render();
+    });
+    tunnelList.key(['down', 'j'], () => {
+      if (modalDepth > 0) {
+        return;
+      }
+      focusLeft = false;
+      moveFocusedSelection(1);
+      applyFocusStyles();
+      screen.render();
+    });
     screen.key(['h', 'р', 'H', 'Р'], () => {
+      if (modalDepth > 0) {
+        return;
+      }
       focusLeft = true;
       hostList.focus();
       applyFocusStyles();
       screen.render();
     });
     screen.key(['t', 'е', 'T', 'Е'], () => {
+      if (modalDepth > 0) {
+        return;
+      }
       focusLeft = false;
       tunnelList.focus();
       applyFocusStyles();
       screen.render();
     });
 
-    screen.key(['e', 'у', 'E', 'У'], () => safeUiAction(runCommandAndShowOutput));
-    screen.key(['i', 'ш', 'I', 'Ш'], () => safeUiAction(runCopyIdAndShowOutput));
-    screen.key(['m', 'ь', 'M', 'Ь'], () => safeUiAction(openSettingsMenuFlow));
-    screen.key(['f1', '?'], () => safeUiAction(openShortcutsHelpFlow));
+    screen.key(['e', 'у', 'E', 'У'], () => {
+      if (modalDepth > 0) {
+        return;
+      }
+      safeUiAction(runCommandAndShowOutput);
+    });
+    screen.key(['i', 'ш', 'I', 'Ш'], () => {
+      if (modalDepth > 0) {
+        return;
+      }
+      safeUiAction(runCopyIdAndShowOutput);
+    });
+    screen.key(['o', 'щ', 'O', 'Щ'], () => {
+      if (modalDepth > 0) {
+        return;
+      }
+      safeUiAction(openLocalFilePickerFlow);
+    });
+    screen.key(['u', 'г', 'U', 'Г'], () => {
+      if (modalDepth > 0) {
+        return;
+      }
+      safeUiAction(openRemoteFilePickerFlow);
+    });
+    screen.key(['y', 'н', 'Y', 'Н'], () => {
+      if (modalDepth > 0) {
+        return;
+      }
+      safeUiAction(runTransferUploadFlow);
+    });
+    screen.key(['b', 'и', 'B', 'И'], () => {
+      if (modalDepth > 0) {
+        return;
+      }
+      safeUiAction(runTransferDownloadFlow);
+    });
+    screen.key(['m', 'ь', 'M', 'Ь'], () => {
+      if (modalDepth > 0) {
+        return;
+      }
+      safeUiAction(openSettingsMenuFlow);
+    });
+    screen.key(['g', 'п', 'G', 'П'], () => {
+      if (modalDepth > 0) {
+        return;
+      }
+      safeUiAction(runKeyAuditAllHostsFlow);
+    });
+    screen.key(['p', 'з', 'P', 'З'], () => {
+      if (modalDepth > 0) {
+        return;
+      }
+      safeUiAction(runPingAllHostsFlow);
+    });
+    screen.key(['f1', '?'], () => {
+      if (modalDepth > 0) {
+        return;
+      }
+      safeUiAction(openShortcutsHelpFlow);
+    });
 
     screen.key(['a', 'ф', 'A', 'Ф'], () => safeUiAction(async () => {
+      if (modalDepth > 0) {
+        return;
+      }
       if (focusLeft) {
         await addHostWizard();
         return;
       }
       await addTunnelWizard();
     }));
-    screen.key(['s', 'ы', 'S', 'Ы'], () => safeUiAction(startSelectedTunnel));
-    screen.key(['x', 'ч', 'X', 'Ч'], () => safeUiAction(stopSelectedTunnel));
+    screen.key(['s', 'ы', 'S', 'Ы'], () => safeUiAction(async () => {
+      if (modalDepth > 0) {
+        return;
+      }
+      await startSelectedTunnel();
+    }));
+    screen.key(['x', 'ч', 'X', 'Ч'], () => safeUiAction(async () => {
+      if (modalDepth > 0) {
+        return;
+      }
+      await stopSelectedTunnel();
+    }));
     screen.key(['d', 'в', 'D', 'В', 'delete'], () => safeUiAction(async () => {
+      if (modalDepth > 0) {
+        return;
+      }
       if (focusLeft) {
         await deleteSelectedHost();
         return;
@@ -3078,6 +3990,9 @@ async function runTui({ state, hosts, saveState }) {
       await deleteSelectedTunnel();
     }));
     screen.key(['enter'], () => safeUiAction(async () => {
+      if (modalDepth > 0) {
+        return;
+      }
       if (focusLeft) {
         await connectSelectedHost();
         return;
@@ -3086,6 +4001,9 @@ async function runTui({ state, hosts, saveState }) {
     }));
 
     screen.key(['c', 'с', 'C', 'С'], () => safeUiAction(async () => {
+      if (modalDepth > 0) {
+        return;
+      }
       await connectSelectedHost();
     }));
 

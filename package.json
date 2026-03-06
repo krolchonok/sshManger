@@ -4,7 +4,8 @@
   "description": "SSHHelper TUI SSH manager",
   "main": "src/index.js",
   "bin": {
-    "sshhelper": "src/index.js"
+    "sshhelper": "src/index.js",
+    "sshh": "src/index.js"
   },
   "files": [
     "src/**/*",

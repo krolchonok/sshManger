@@ -32,7 +32,7 @@ npm i -g .
 npm i -g @ushastoe/sshhelper
 ```
 
-Command name: `sshhelper`
+Command names: `sshhelper`, `sshh`
 
 ## Run
 

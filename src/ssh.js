@@ -9,6 +9,7 @@ const { nowIso } = require('./state');
 const DEFAULT_COMMAND_OUTPUT_LIMIT_BYTES = 200 * 1024;
 const DEFAULT_PROBE_OUTPUT_LIMIT_BYTES = 16 * 1024;
 const DEFAULT_PROBE_TIMEOUT_MS = 12_000;
+const DEFAULT_PING_TIMEOUT_MS = 3_000;
 
 function isProcessAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) {
@@ -444,7 +445,7 @@ function isSshAuthFailureText(text) {
   );
 }
 
-function probeSshKeyAuth(host) {
+function probeSshKeyAuth(host, options = {}) {
   return new Promise((resolve) => {
     const targetHost = String(host || '').trim();
     if (!targetHost) {
@@ -483,6 +484,13 @@ function probeSshKeyAuth(host) {
       });
     };
 
+    const timeoutMs = Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
+      ? Math.floor(options.timeoutMs)
+      : DEFAULT_PROBE_TIMEOUT_MS;
+    const connectTimeoutSec = Number.isFinite(options.connectTimeoutSec) && options.connectTimeoutSec > 0
+      ? Math.floor(options.connectTimeoutSec)
+      : 8;
+
     const args = [
       '-n',
       '-o',
@@ -496,7 +504,7 @@ function probeSshKeyAuth(host) {
       '-o',
       'KbdInteractiveAuthentication=no',
       '-o',
-      'ConnectTimeout=8',
+      `ConnectTimeout=${connectTimeoutSec}`,
       targetHost,
       'exit'
     ];
@@ -521,14 +529,14 @@ function probeSshKeyAuth(host) {
       finish({
         ok: false,
         authFailed: false,
-        error: `SSH key auth probe timed out after ${DEFAULT_PROBE_TIMEOUT_MS}ms`
+        error: `SSH key auth probe timed out after ${timeoutMs}ms`
       });
       try {
         child.kill();
       } catch (error) {
         // ignore kill errors for timeout path
       }
-    }, DEFAULT_PROBE_TIMEOUT_MS);
+    }, timeoutMs);
 
     if (child.stdout) {
       child.stdout.on('data', (chunk) => {
@@ -591,6 +599,251 @@ function probeSshKeyAuth(host) {
       });
     });
   });
+}
+
+function runPingCheck(host, options = {}) {
+  return new Promise((resolve) => {
+    const targetHost = String(host || '').trim();
+    if (!targetHost) {
+      resolve({
+        ok: false,
+        code: null,
+        signal: null,
+        error: 'Host is required',
+        output: ''
+      });
+      return;
+    }
+
+    const timeoutMs = Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
+      ? Math.floor(options.timeoutMs)
+      : DEFAULT_PING_TIMEOUT_MS;
+    const outputLimitBytes = Number.isFinite(options.outputLimitBytes) && options.outputLimitBytes > 0
+      ? Math.floor(options.outputLimitBytes)
+      : DEFAULT_PROBE_OUTPUT_LIMIT_BYTES;
+
+    const isWin = process.platform === 'win32';
+    const args = isWin
+      ? ['-n', '1', '-w', String(timeoutMs), targetHost]
+      : ['-n', '-c', '1', '-W', String(Math.max(1, Math.ceil(timeoutMs / 1000))), targetHost];
+
+    const chunks = [];
+    let totalSize = 0;
+    let captured = 0;
+    let done = false;
+    let timeoutRef = null;
+    let child = null;
+
+    const finish = (result) => {
+      if (done) {
+        return;
+      }
+      done = true;
+      if (timeoutRef) {
+        clearTimeout(timeoutRef);
+      }
+      resolve({
+        ok: Boolean(result.ok),
+        code: typeof result.code === 'number' ? result.code : null,
+        signal: result.signal || null,
+        error: result.error || '',
+        output: Buffer.concat(chunks, totalSize).toString('utf8')
+      });
+    };
+
+    try {
+      child = spawn('ping', args, {
+        cwd: process.cwd(),
+        env: { ...process.env }
+      });
+    } catch (error) {
+      finish({ ok: false, error: error.message });
+      return;
+    }
+
+    timeoutRef = setTimeout(() => {
+      try {
+        child.kill();
+      } catch (error) {
+        // ignore kill errors in timeout path
+      }
+      finish({ ok: false, error: `Ping timed out after ${timeoutMs}ms` });
+    }, timeoutMs + 1_000);
+
+    const onData = (chunk) => {
+      const appended = appendLimitedChunk(chunks, totalSize, chunk, outputLimitBytes - captured);
+      totalSize = appended.totalSize;
+      captured += appended.addedBytes;
+    };
+
+    if (child.stdout) {
+      child.stdout.on('data', onData);
+    }
+    if (child.stderr) {
+      child.stderr.on('data', onData);
+    }
+
+    child.on('error', (error) => {
+      finish({ ok: false, error: error.message });
+    });
+
+    child.on('close', (code, signal) => {
+      finish({
+        ok: code === 0,
+        code: typeof code === 'number' ? code : null,
+        signal: signal || null,
+        error: ''
+      });
+    });
+  });
+}
+
+function runLocalCommand(command, args = [], options = {}) {
+  return new Promise((resolve) => {
+    const executable = String(command || '').trim();
+    if (!executable) {
+      resolve({
+        code: null,
+        signal: null,
+        error: 'Command is required',
+        truncated: false,
+        stdout: '',
+        stderr: '',
+        timedOut: false
+      });
+      return;
+    }
+
+    const commandArgs = Array.isArray(args) ? args.map((item) => String(item)) : [];
+    const outputLimitBytes = Number.isFinite(options.outputLimitBytes) && options.outputLimitBytes > 0
+      ? Math.floor(options.outputLimitBytes)
+      : DEFAULT_COMMAND_OUTPUT_LIMIT_BYTES;
+    const timeoutMs = Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
+      ? Math.floor(options.timeoutMs)
+      : 0;
+
+    const stdoutChunks = [];
+    const stderrChunks = [];
+    let stdoutSize = 0;
+    let stderrSize = 0;
+    let totalCaptured = 0;
+    let truncated = false;
+    let done = false;
+    let timeoutRef = null;
+    let child = null;
+
+    const finish = (result) => {
+      if (done) {
+        return;
+      }
+      done = true;
+      if (timeoutRef) {
+        clearTimeout(timeoutRef);
+      }
+      resolve({
+        code: typeof result.code === 'number' ? result.code : null,
+        signal: result.signal || null,
+        error: result.error || null,
+        truncated,
+        stdout: Buffer.concat(stdoutChunks, stdoutSize).toString('utf8'),
+        stderr: Buffer.concat(stderrChunks, stderrSize).toString('utf8'),
+        timedOut: Boolean(result.timedOut)
+      });
+    };
+
+    try {
+      child = spawn(executable, commandArgs, {
+        cwd: typeof options.cwd === 'string' && options.cwd ? options.cwd : process.cwd(),
+        env: options.env && typeof options.env === 'object' ? options.env : { ...process.env }
+      });
+    } catch (error) {
+      finish({ error: error.message, timedOut: false });
+      return;
+    }
+
+    if (timeoutMs > 0) {
+      timeoutRef = setTimeout(() => {
+        try {
+          child.kill();
+        } catch (error) {
+          // ignore kill errors in timeout path
+        }
+        finish({
+          code: null,
+          signal: null,
+          error: `Command timed out after ${timeoutMs}ms`,
+          timedOut: true
+        });
+      }, timeoutMs);
+    }
+
+    if (child.stdout) {
+      child.stdout.on('data', (chunk) => {
+        const appended = appendLimitedChunk(
+          stdoutChunks,
+          stdoutSize,
+          chunk,
+          outputLimitBytes - totalCaptured
+        );
+        stdoutSize = appended.totalSize;
+        totalCaptured += appended.addedBytes;
+        truncated = truncated || appended.truncated;
+      });
+    }
+
+    if (child.stderr) {
+      child.stderr.on('data', (chunk) => {
+        const appended = appendLimitedChunk(
+          stderrChunks,
+          stderrSize,
+          chunk,
+          outputLimitBytes - totalCaptured
+        );
+        stderrSize = appended.totalSize;
+        totalCaptured += appended.addedBytes;
+        truncated = truncated || appended.truncated;
+      });
+    }
+
+    child.on('error', (error) => {
+      finish({
+        code: null,
+        signal: null,
+        error: error.message,
+        timedOut: false
+      });
+    });
+
+    child.on('close', (code, signal) => {
+      finish({
+        code: typeof code === 'number' ? code : null,
+        signal: signal || null,
+        error: null,
+        timedOut: false
+      });
+    });
+  });
+}
+
+async function commandExists(commandName) {
+  const bin = String(commandName || '').trim();
+  if (!bin) {
+    return false;
+  }
+
+  if (process.platform === 'win32') {
+    const result = await runLocalCommand('where', [bin], {
+      outputLimitBytes: 16 * 1024,
+      timeoutMs: 5_000
+    });
+    return result.code === 0;
+  }
+
+  const result = await runLocalCommand('sh', ['-lc', `command -v ${bin}`], {
+    outputLimitBytes: 16 * 1024,
+    timeoutMs: 5_000
+  });
+  return result.code === 0;
 }
 
 function startTunnel(tunnel, password) {
@@ -705,6 +958,9 @@ module.exports = {
   runSshCommand,
   runSshCopyId,
   probeSshKeyAuth,
+  runPingCheck,
+  runLocalCommand,
+  commandExists,
   appendTunnelLog,
   startTunnel,
   stopTunnel,
